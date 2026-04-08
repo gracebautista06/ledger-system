@@ -1,0 +1,188 @@
+/* --- Farm-Inspired Modern Palette --- */
+:root {
+    --primary-yolk: #FFC300;
+    --accent-orange: #FF6B35;
+    --barn-red: #8B1E1E;
+    --dark-nest: #2E2E2E;
+    --egg-white: #FFFFFF;
+    --hay-beige: #FAF7F2;
+    --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.1);
+    --shadow-strong: 0 8px 24px rgba(0, 0, 0, 0.15);
+    --radius: 10px;
+    --transition: 0.3s ease;
+}
+
+/* --- Animations --- */
+@keyframes float {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-12px); }
+    100% { transform: translateY(0px); }
+}
+
+@keyframes slideUp {
+    from { opacity: 0; transform: translateY(30px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* --- Global Layout --- */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Poppins', 'Open Sans', 'Segoe UI', sans-serif;
+}
+
+body {
+    background-color: var(--hay-beige);
+    /* Subtle Farm Pattern Background */
+    background-image: radial-gradient(var(--primary-yolk) 0.8px, transparent 0.8px);
+    background-size: 24px 24px;
+    color: var(--dark-nest);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* --- Content Container --- */
+.container {
+    flex: 1;
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+    width: 100%;
+    animation: slideUp 0.8s ease-out; /* Everything in container slides up */
+}
+
+/* --- Header: "The Modern Barn" --- */
+.navbar {
+    background: linear-gradient(90deg, var(--primary-yolk), var(--accent-orange));
+    padding: 1.2rem 2rem;
+    color: var(--dark-nest);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: var(--shadow-soft);
+    border-bottom: 4px solid var(--barn-red);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.logo {
+    font-size: 1.9rem;
+    font-weight: 800;
+    color: var(--barn-red);
+    letter-spacing: 1px;
+    text-shadow: 1px 1px var(--egg-white);
+    display: flex;
+    align-items: center;
+}
+
+/* Make the logo emoji float */
+.logo::before {
+    content: "🥚";
+    margin-right: 10px;
+    animation: float 3s ease-in-out infinite;
+}
+
+.nav-links {
+    list-style: none;
+    display: flex;
+    gap: 1.8rem;
+}
+
+.nav-links a {
+    text-decoration: none;
+    color: var(--dark-nest);
+    font-weight: 600;
+    font-size: 1rem;
+    transition: color var(--transition), transform var(--transition);
+}
+
+.nav-links a:hover {
+    color: var(--barn-red);
+    transform: translateY(-2px);
+}
+
+/* --- Cards & Moving Objects --- */
+.card {
+    background: var(--egg-white);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-soft);
+    padding: 2rem;
+    margin-bottom: 1.5rem;
+    transition: transform var(--transition), box-shadow var(--transition);
+    text-align: center; /* Centered for the index page */
+}
+
+.card:hover {
+    transform: translateY(-6px);
+    box-shadow: var(--shadow-strong);
+}
+
+/* Class to make icons move */
+.floating-icon {
+    font-size: 3.5rem;
+    display: inline-block;
+    margin-bottom: 1rem;
+    animation: float 4s ease-in-out infinite;
+}
+
+.card h3 {
+    color: var(--barn-red);
+    margin-bottom: 0.6rem;
+}
+
+/* --- Buttons --- */
+.btn-farm {
+    background-color: var(--barn-red);
+    color: var(--egg-white);
+    padding: 12px 26px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 1.05rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none; /* For <a> tags used as buttons */
+    display: inline-block;
+    box-shadow: var(--shadow-soft);
+    transition: all var(--transition);
+}
+
+.btn-farm:hover {
+    background-color: var(--dark-nest);
+    transform: scale(1.05);
+    box-shadow: 0 0 15px rgba(255, 107, 53, 0.4);
+}
+
+/* --- Form Inputs --- */
+.form-input {
+    width: 100%;
+    padding: 14px;
+    border: 2px solid #ddd;
+    border-radius: var(--radius);
+    font-size: 1rem;
+    background: var(--egg-white);
+    transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.form-input:focus {
+    border-color: var(--accent-orange);
+    box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.25);
+    outline: none;
+}
+
+/* --- Footer --- */
+.main-footer {
+    background-color: var(--dark-nest);
+    color: var(--egg-white);
+    text-align: center;
+    padding: 2.5rem 1rem;
+    border-top: 5px solid var(--primary-yolk);
+}
+
+/* --- Responsive --- */
+@media (max-width: 768px) {
+    .navbar { flex-direction: column; gap: 0.8rem; }
+    .nav-links { gap: 1rem; }
+}
