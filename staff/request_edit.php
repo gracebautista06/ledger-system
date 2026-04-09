@@ -1,40 +1,127 @@
-<?php 
-    session_start();
-    include('../includes/db.php'); 
-    include('../includes/header.php'); 
+<?php
+/*  staff/request_edit.php — Submit a Log Correction Request  */
+$page_title = 'Request Edit';
 
-    $type = $_GET['type'];
-    $id = intval($_GET['id']);
+include('../includes/db.php');
+include('../includes/header.php');
 
-    if ($_SERVER["REQUEST_METHOD"] == "POST") {
-        $reason = mysqli_real_escape_string($conn, $_POST['reason']);
-        $staff_id = $_SESSION['user_id'];
-        
-        // We package the new numbers into a JSON string to keep it clean
-        $new_values = json_encode($_POST['new_data']);
+if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
+    header("Location: ../portal/login.php"); exit();
+}
 
-        $sql = "INSERT INTO edit_requests (staff_id, record_type, record_id, new_data, reason) 
-                VALUES ('$staff_id', '$type', '$id', '$new_values', '$reason')";
-        
-        if ($conn->query($sql)) {
-            echo "<script>alert('Request sent to Owner for approval!'); window.location='view_logs.php';</script>";
+$staff_id = (int) $_SESSION['user_id'];
+
+$allowed_types = ['Harvest', 'Health'];
+$type = (isset($_GET['type']) && in_array($_GET['type'], $allowed_types)) ? $_GET['type'] : null;
+$id   = (int) ($_GET['id'] ?? 0);
+
+if (!$type || $id <= 0) { header("Location: view_logs.php"); exit(); }
+
+// FIX: Ownership check via prepared statement
+$original = null;
+if ($type === 'Harvest') {
+    $res_stmt = $conn->prepare("SELECT h.*, b.breed FROM harvests h JOIN batches b ON h.batch_id=b.batch_id WHERE h.harvest_id=? AND h.staff_id=? LIMIT 1");
+    $res_stmt->bind_param("ii", $id, $staff_id);
+} else {
+    $res_stmt = $conn->prepare("SELECT fh.*, b.breed FROM flock_health fh JOIN batches b ON fh.batch_id=b.batch_id WHERE fh.report_id=? AND fh.staff_id=? LIMIT 1");
+    $res_stmt->bind_param("ii", $id, $staff_id);
+}
+$res_stmt->execute();
+$res = $res_stmt->get_result();
+if ($res->num_rows === 0) { header("Location: view_logs.php"); exit(); }
+$original = $res->fetch_assoc();
+$res_stmt->close();
+
+// Check for already-pending request
+$dup_stmt = $conn->prepare("SELECT request_id FROM edit_requests WHERE staff_id=? AND record_type=? AND record_id=? AND status='Pending' LIMIT 1");
+$dup_stmt->bind_param("isi", $staff_id, $type, $id);
+$dup_stmt->execute();
+$dup_stmt->store_result();
+$already_pending = $dup_stmt->num_rows > 0;
+$dup_stmt->close();
+
+$message = "";
+
+if ($_SERVER["REQUEST_METHOD"] === "POST" && !$already_pending) {
+    $reason   = trim($_POST['reason'] ?? '');
+    $new_data = $type === 'Harvest'
+        ? json_encode(['total_eggs'      => max(0, (int)($_POST['new_total']     ?? 0))])
+        : json_encode(['mortality_count' => max(0, (int)($_POST['new_mortality'] ?? 0))]);
+
+    if (empty($reason)) {
+        $message = "<div class='alert error'>⚠️ Please provide a reason for the correction.</div>";
+    } else {
+        // FIX: Prepared statement insert
+        $ins = $conn->prepare("INSERT INTO edit_requests (staff_id, record_type, record_id, new_data, reason) VALUES (?,?,?,?,?)");
+        $ins->bind_param("isiss", $staff_id, $type, $id, $new_data, $reason);
+        if ($ins->execute()) {
+            $ins->close();
+            header("Location: view_logs.php?request_sent=1"); exit();
+        } else {
+            $message = "<div class='alert error'>Database error. Please try again.</div>";
         }
+        $ins->close();
     }
+}
 ?>
 
-<div class="card" style="max-width: 500px; margin: 2rem auto; border-top: 8px solid var(--accent-orange);">
-    <h3>Request Record Correction</h3>
-    <p style="color: #666; font-size: 0.9rem;">Original Record: <strong><?php echo $type; ?> #<?php echo $id; ?></strong></p>
+<div class="card" style="max-width:540px; margin:2rem auto; border-top:5px solid var(--terra-lt);">
+    <h3 style="color:var(--gold); font-family:'Playfair Display',serif; margin-bottom:0.3rem;">✏️ Request Record Correction</h3>
+    <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:2rem;">
+        This sends a correction request to the Owner for review.
+    </p>
 
-    <form method="POST">
-        <div class="form-group">
-            <label>Why do you need to change this?</label>
-            <textarea name="reason" class="form-input" required placeholder="Example: I typed 50 instead of 5 for Peewee sizes by mistake."></textarea>
-        </div>
+    <!-- Original record summary -->
+    <div style="background:var(--bg-wood); border-radius:var(--radius); padding:14px 16px; border-left:4px solid var(--border-mid); margin-bottom:1.5rem;">
+        <p style="font-size:0.75rem; font-weight:700; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.6px;">
+            Original Record — <?php echo $type; ?> #<?php echo $id; ?>
+        </p>
+        <?php if ($type === 'Harvest'): ?>
+            <p style="margin:0; font-size:0.9rem; color:var(--text-primary);">
+                Batch: <strong><?php echo htmlspecialchars($original['breed']); ?></strong> &nbsp;|&nbsp;
+                Total: <strong style="color:var(--gold);"><?php echo number_format($original['total_eggs']); ?> eggs</strong><br>
+                <small style="color:var(--text-muted);">Logged: <?php echo date('M d, Y g:i A', strtotime($original['date_logged'])); ?></small>
+            </p>
+        <?php else: ?>
+            <p style="margin:0; font-size:0.9rem; color:var(--text-primary);">
+                Batch: <strong><?php echo htmlspecialchars($original['breed']); ?></strong> &nbsp;|&nbsp;
+                Status: <strong><?php echo $original['status_level']; ?></strong> &nbsp;|&nbsp;
+                Mortality: <strong style="color:var(--gold);"><?php echo $original['mortality_count']; ?></strong><br>
+                <small style="color:var(--text-muted);">Reported: <?php echo date('M d, Y g:i A', strtotime($original['date_reported'])); ?></small>
+            </p>
+        <?php endif; ?>
+    </div>
 
-        <p style="font-weight: bold; margin-top: 1rem;">Input Corrected Values:</p>
-        <input type="number" name="new_data[total_eggs]" class="form-input" placeholder="New Total" required>
-        
-        <button type="submit" class="btn-farm" style="width: 100%; margin-top: 1rem;">Send to Owner</button>
-    </form>
+    <?php if ($already_pending): ?>
+        <div class="alert warning">⏳ You already have a pending request for this record. Wait for the Owner to review it first.</div>
+        <a href="view_logs.php" class="btn-farm btn-outline btn-full" style="text-align:center; margin-top:1rem;">← Back to My Logs</a>
+    <?php else: ?>
+        <?php echo $message; ?>
+        <form method="POST">
+            <div class="form-group">
+                <label>Why do you need to correct this? <span style="color:var(--danger);">*</span></label>
+                <textarea name="reason" class="form-input" rows="3" required
+                          placeholder="Example: I typed 500 instead of 50 by mistake."></textarea>
+            </div>
+            <?php if ($type === 'Harvest'): ?>
+                <div class="form-group">
+                    <label>Corrected Total Eggs</label>
+                    <input type="number" name="new_total" class="form-input" min="0" required
+                           value="<?php echo $original['total_eggs']; ?>">
+                </div>
+            <?php else: ?>
+                <div class="form-group">
+                    <label>Corrected Mortality Count</label>
+                    <input type="number" name="new_mortality" class="form-input" min="0" required
+                           value="<?php echo $original['mortality_count']; ?>">
+                </div>
+            <?php endif; ?>
+            <button type="submit" class="btn-farm btn-orange btn-full" style="padding:14px; margin-top:0.5rem;">
+                📤 Send to Owner for Review
+            </button>
+        </form>
+        <a href="view_logs.php" class="back-link" style="display:block; text-align:center; margin-top:1rem;">← Cancel and Go Back</a>
+    <?php endif; ?>
 </div>
+
+<?php include('../includes/footer.php'); ?>

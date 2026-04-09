@@ -1,41 +1,60 @@
-<?php 
-    session_start();
-    include('../includes/db.php'); 
-    include('../includes/header.php'); 
+<?php
+/*  staff/log_health.php — Flock Health Report  */
+$page_title = 'Flock Health Report';
 
-    // Security: Only Staff can access
-    if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
-        header("Location: ../portal/login.php");
-        exit();
-    }
+include('../includes/db.php');
+include('../includes/header.php');
 
-    $message = "";
+if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
+    header("Location: ../portal/login.php"); exit();
+}
 
-    // Fetch Active Batches
-    $batch_query = $conn->query("SELECT batch_id, breed FROM batches WHERE status = 'Active'");
+$message = "";
 
-    if ($_SERVER["REQUEST_METHOD"] == "POST") {
-        $staff_id = $_SESSION['user_id'];
-        $batch_id = $_POST['batch_id'];
-        $status_level = $_POST['status_level']; // e.g., Healthy, Warning, Critical
-        $mortality_count = intval($_POST['mortality_count']);
-        $symptoms = mysqli_real_escape_string($conn, $_POST['symptoms']);
+// FIX: Prepared statement for batch fetch
+$batch_stmt = $conn->prepare("SELECT batch_id, breed FROM batches WHERE status='Active' ORDER BY batch_id ASC");
+$batch_stmt->execute();
+$batch_query = $batch_stmt->get_result();
+$batch_stmt->close();
 
-        // Assuming you have a 'flock_health' table (SQL below)
-        $sql = "INSERT INTO flock_health (staff_id, batch_id, status_level, mortality_count, symptoms) 
-                VALUES ('$staff_id', '$batch_id', '$status_level', '$mortality_count', '$symptoms')";
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $staff_id        = (int) $_SESSION['user_id'];
+    $batch_id        = (int) ($_POST['batch_id'] ?? 0);
+    $mortality_count = max(0, (int) ($_POST['mortality_count'] ?? 0));
+    $symptoms        = trim($_POST['symptoms'] ?? '');
 
-        if ($conn->query($sql) === TRUE) {
-            $message = "<div class='alert success'>✅ Health report submitted for Batch #$batch_id.</div>";
+    // Whitelist status_level
+    $allowed_levels = ['Healthy', 'Warning', 'Critical'];
+    $status_level   = in_array($_POST['status_level'] ?? '', $allowed_levels) ? $_POST['status_level'] : 'Healthy';
+
+    // FIX: Validate batch with prepared statement
+    $check = $conn->prepare("SELECT batch_id FROM batches WHERE batch_id=? AND status='Active' LIMIT 1");
+    $check->bind_param("i", $batch_id);
+    $check->execute();
+    $check->store_result();
+    $valid_batch = $check->num_rows > 0;
+    $check->close();
+
+    if (!$valid_batch) {
+        $message = "<div class='alert error'>⚠️ Please select a valid active batch.</div>";
+    } else {
+        // FIX: Full prepared statement insert
+        $ins = $conn->prepare("INSERT INTO flock_health (staff_id, batch_id, status_level, mortality_count, symptoms) VALUES (?,?,?,?,?)");
+        $ins->bind_param("iisis", $staff_id, $batch_id, $status_level, $mortality_count, $symptoms);
+        if ($ins->execute()) {
+            $ins->close();
+            header("Location: view_logs.php?health_saved=1"); exit();
         } else {
-            $message = "<div class='alert error'>Database Error: " . $conn->error . "</div>";
+            $message = "<div class='alert error'>Database error. Please try again.</div>";
         }
+        $ins->close();
     }
+}
 ?>
 
-<div class="card" style="max-width: 600px; margin: 2rem auto; border-top: 8px solid var(--accent-orange);">
-    <h2 style="color: var(--dark-nest);">🐔 Flock Health Report</h2>
-    <p style="color: #666; margin-bottom: 2rem;">Report any bird deaths, sickness, or general flock behavior.</p>
+<div class="card" style="max-width:600px; margin:2rem auto; border-top:5px solid var(--terra-lt);">
+    <h2 style="color:var(--gold); font-family:'Playfair Display',serif;">🐔 Flock Health Report</h2>
+    <p style="color:var(--text-muted); margin-bottom:2rem;">Report bird deaths, illness signs, or general observations.</p>
 
     <?php echo $message; ?>
 
@@ -43,21 +62,25 @@
         <div class="form-group">
             <label>Select Flock Batch</label>
             <select name="batch_id" class="form-input" required>
-                <option value="" disabled selected>-- Select Batch --</option>
-                <?php while($batch = $batch_query->fetch_assoc()): ?>
-                    <option value="<?php echo $batch['batch_id']; ?>">
-                        Batch #<?php echo $batch['batch_id']; ?> (<?php echo $batch['breed']; ?>)
-                    </option>
-                <?php endwhile; ?>
+                <option value="" disabled selected>-- Select Active Batch --</option>
+                <?php
+                if ($batch_query && $batch_query->num_rows > 0) {
+                    while ($b = $batch_query->fetch_assoc()) {
+                        echo "<option value='{$b['batch_id']}'>Batch #{$b['batch_id']} ({$b['breed']})</option>";
+                    }
+                } else {
+                    echo "<option disabled>No active batches</option>";
+                }
+                ?>
             </select>
         </div>
 
         <div class="form-group">
             <label>Overall Health Status</label>
             <select name="status_level" class="form-input" required>
-                <option value="Healthy" style="color: green;">🟢 Healthy (Normal)</option>
-                <option value="Warning" style="color: orange;">🟡 Warning (Minor Issues)</option>
-                <option value="Critical" style="color: red;">🔴 Critical (High Mortality/Disease)</option>
+                <option value="Healthy">🟢 Healthy — Normal behavior, no issues</option>
+                <option value="Warning">🟡 Warning — Minor concerns observed</option>
+                <option value="Critical">🔴 Critical — High mortality or disease signs</option>
             </select>
         </div>
 
@@ -67,29 +90,29 @@
         </div>
 
         <div class="form-group">
-            <label>Symptoms or Notes</label>
-            <textarea name="symptoms" class="form-input" rows="4" placeholder="Describe behavior: e.g., sluggishness, coughing, or 'The birds look active and energetic.'"></textarea>
+            <label>Observations / Symptoms</label>
+            <textarea name="symptoms" class="form-input" rows="4"
+                      placeholder="e.g., Birds sluggish, reduced feed intake — or — All birds active and eating normally."></textarea>
         </div>
 
-        <button type="submit" class="btn-farm" style="width: 100%; padding: 18px; background: var(--accent-orange); border-bottom: 4px solid #d35400;">Submit Health Report</button>
-        <a href="dashboard.php" id="backBtn" style="display: block; text-align: center; margin-top: 1.5rem; color: #888; text-decoration: none;">← Back to Dashboard</a>
+        <button type="submit" class="btn-farm btn-orange btn-full" style="padding:16px;">
+            Submit Health Report 🐔
+        </button>
+        <a href="dashboard.php" id="backBtn" class="back-link" style="display:block; text-align:center; margin-top:1rem;">
+            ← Back to Dashboard
+        </a>
     </form>
 </div>
 
 <script>
-    // Safety Net: Warn if they try to leave with unsaved data
-    let isDirty = false;
-    document.getElementById('healthForm').addEventListener('input', () => isDirty = true);
-
-    window.addEventListener('beforeunload', (e) => {
-        if (isDirty) { e.preventDefault(); e.returnValue = ''; }
-    });
-
-    document.getElementById('backBtn').addEventListener('click', (e) => {
-        if (isDirty && !confirm("Discard unsaved health report?")) e.preventDefault();
-    });
-
-    document.getElementById('healthForm').addEventListener('submit', () => isDirty = false);
+let isDirty = false;
+const healthForm = document.getElementById('healthForm');
+healthForm.addEventListener('input', () => isDirty = true);
+healthForm.addEventListener('submit', () => isDirty = false);
+window.addEventListener('beforeunload', e => { if (isDirty) { e.preventDefault(); e.returnValue = ''; } });
+document.getElementById('backBtn').addEventListener('click', e => {
+    if (isDirty && !confirm("Discard unsaved health report?")) e.preventDefault();
+});
 </script>
 
 <?php include('../includes/footer.php'); ?>

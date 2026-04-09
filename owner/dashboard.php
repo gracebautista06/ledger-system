@@ -1,136 +1,438 @@
-<?php 
-    session_start();
-    include('../includes/db.php'); 
-    include('../includes/header.php'); 
+<?php
+/* ============================================================
+   owner/dashboard.php — Owner/Admin Command Center
 
-    if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Owner') {
-        header("Location: ../portal/login.php");
-        exit();
-    }
+   IMPROVEMENTS v2:
+   - Added Revenue vs Harvest dual-chart (line + bar combo)
+   - Added "Top Customers This Month" widget from sales data
+   - Added "Flock Health Summary" — shows any active Critical/Warning batches
+   - Added "Next Batch Replacement" pulled dynamically from DB
+   - Monthly revenue trend (last 6 months) added as second chart
+   - All hardcoded colors replaced with new dark theme CSS vars
+   - Stat cards now show change vs. yesterday (harvest) and last month (revenue)
+   ============================================================ */
 
-    // Fetch the count of pending edit requests
-    $request_query = $conn->query("SELECT COUNT(*) as total FROM edit_requests WHERE status = 'Pending'");
-    $request_data = $request_query->fetch_assoc();
-    $pending_count = $request_data['total'];
+$page_title = 'Owner Dashboard';
+
+session_start();
+include('../includes/db.php');
+include('../staff/sell_first_alert.php');
+include('../includes/header.php');
+
+if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Owner') {
+    header("Location: ../portal/login.php");
+    exit();
+}
+
+// --- STAT: Pending edit requests ---
+$req_query     = $conn->query("SELECT COUNT(*) AS total FROM edit_requests WHERE status = 'Pending'");
+$pending_count = (int) $req_query->fetch_assoc()['total'];
+
+// --- STAT: Today's harvest ---
+$today_query = $conn->query("SELECT COALESCE(SUM(total_eggs), 0) AS today_eggs FROM harvests WHERE DATE(date_logged) = CURDATE()");
+$today_eggs  = (int) $today_query->fetch_assoc()['today_eggs'];
+
+// --- STAT: Yesterday's harvest (for comparison arrow) ---
+$yest_query  = $conn->query("SELECT COALESCE(SUM(total_eggs), 0) AS yest FROM harvests WHERE DATE(date_logged) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)");
+$yest_eggs   = (int) $yest_query->fetch_assoc()['yest'];
+$harvest_diff = $today_eggs - $yest_eggs;
+
+// --- STAT: Total staff count ---
+$staff_query = $conn->query("SELECT COUNT(*) AS total FROM users WHERE role = 'Staff'");
+$staff_count = (int) $staff_query->fetch_assoc()['total'];
+
+// --- STAT: This month's revenue ---
+$rev_query   = $conn->query("SELECT COALESCE(SUM(total_amount), 0) AS month_rev FROM sales WHERE MONTH(date_sold)=MONTH(NOW()) AND YEAR(date_sold)=YEAR(NOW())");
+$month_rev   = (float) $rev_query->fetch_assoc()['month_rev'];
+
+// --- STAT: Last month's revenue (for comparison) ---
+$prev_rev_q  = $conn->query("SELECT COALESCE(SUM(total_amount), 0) AS prev_rev FROM sales WHERE MONTH(date_sold)=MONTH(DATE_SUB(NOW(),INTERVAL 1 MONTH)) AND YEAR(date_sold)=YEAR(DATE_SUB(NOW(),INTERVAL 1 MONTH))");
+$prev_rev    = (float) $prev_rev_q->fetch_assoc()['prev_rev'];
+$rev_pct     = $prev_rev > 0 ? round((($month_rev - $prev_rev) / $prev_rev) * 100, 1) : null;
+
+
+// --- STAT: Active sell-first notification (old stock) ---
+$sell_notif_q   = $conn->query("SELECT n.*, b.breed FROM notifications n JOIN batches b ON n.batch_id=b.batch_id WHERE n.status IN ('unread','read') ORDER BY n.created_at DESC LIMIT 1");
+$sell_notif     = ($sell_notif_q && $sell_notif_q->num_rows > 0) ? $sell_notif_q->fetch_assoc() : null;
+
+// --- STAT: Completed (old stock fully sold) notifications since yesterday ---
+$completed_notif_q = $conn->query("SELECT n.*, b.breed FROM notifications n JOIN batches b ON n.batch_id=b.batch_id WHERE n.status='completed' AND n.completed_at >= DATE_SUB(NOW(), INTERVAL 1 DAY) ORDER BY n.completed_at DESC LIMIT 1");
+$completed_notif   = ($completed_notif_q && $completed_notif_q->num_rows > 0) ? $completed_notif_q->fetch_assoc() : null;
+
+// --- CHART 1: Last 7 days harvest ---
+$chart_labels = [];
+$chart_data   = [];
+for ($i = 6; $i >= 0; $i--) {
+    $d = date('Y-m-d', strtotime("-$i days"));
+    $q = $conn->query("SELECT COALESCE(SUM(total_eggs),0) AS total FROM harvests WHERE DATE(date_logged)='$d'");
+    $chart_labels[] = date('D', strtotime($d));
+    $chart_data[]   = (int) $q->fetch_assoc()['total'];
+}
+
+// --- CHART 2: Last 6 months revenue ---
+$rev_labels = [];
+$rev_data   = [];
+for ($i = 5; $i >= 0; $i--) {
+    $m_start = date('Y-m-01', strtotime("-$i months"));
+    $m_end   = date('Y-m-t',  strtotime("-$i months"));
+    $rev_q   = $conn->query("SELECT COALESCE(SUM(total_amount),0) AS rev FROM sales WHERE DATE(date_sold) BETWEEN '$m_start' AND '$m_end'");
+    $rev_labels[] = date('M', strtotime($m_start));
+    $rev_data[]   = round((float) $rev_q->fetch_assoc()['rev'], 2);
+}
+
+// --- TOP CUSTOMERS this month ---
+$top_cust = $conn->query("
+    SELECT customer_name,
+           COUNT(*) AS txn_count,
+           SUM(total_amount) AS total_spent,
+           SUM(quantity_sold) AS trays
+    FROM sales
+    WHERE MONTH(date_sold)=MONTH(NOW()) AND YEAR(date_sold)=YEAR(NOW())
+    GROUP BY customer_name
+    ORDER BY total_spent DESC
+    LIMIT 5
+");
+
+// --- FLOCK HEALTH SUMMARY (latest report per batch) ---
+$health_q = $conn->query("
+    SELECT fh.batch_id, b.breed, fh.status_level, fh.mortality_count, fh.date_reported
+    FROM flock_health fh
+    JOIN batches b ON fh.batch_id = b.batch_id
+    WHERE b.status = 'Active'
+      AND fh.report_id = (
+          SELECT MAX(fh2.report_id) FROM flock_health fh2 WHERE fh2.batch_id = fh.batch_id
+      )
+    ORDER BY FIELD(fh.status_level,'Critical','Warning','Healthy')
+    LIMIT 4
+");
+
+// --- NEXT BATCH REPLACEMENT ---
+$next_batch = $conn->query("
+    SELECT batch_id, breed, expected_replacement
+    FROM batches
+    WHERE status='Active' AND expected_replacement IS NOT NULL
+    ORDER BY expected_replacement ASC
+    LIMIT 1
+");
+$nb = $next_batch ? $next_batch->fetch_assoc() : null;
+$days_left = $nb ? (int) ceil((strtotime($nb['expected_replacement']) - time()) / 86400) : null;
+
+$js_labels   = json_encode($chart_labels);
+$js_data     = json_encode($chart_data);
+$js_rev_lbl  = json_encode($rev_labels);
+$js_rev_data = json_encode($rev_data);
 ?>
-
-<style>
-    /* Pulsing Red Dot Animation */
-    .red-dot {
-        height: 10px;
-        width: 10px;
-        background-color: #ff4d4d;
-        border-radius: 50%;
-        display: inline-block;
-        margin-right: 8px;
-        box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.7);
-        animation: pulse-red 2s infinite;
-    }
-
-    @keyframes pulse-red {
-        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.7); }
-        70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(255, 77, 77, 0); }
-        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 77, 77, 0); }
-    }
-
-    .sidebar-dot {
-        height: 8px;
-        width: 8px;
-        background-color: #ff4d4d;
-        border-radius: 50%;
-        display: inline-block;
-        margin-right: 5px;
-    }
-</style>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-<div class="owner-header" style="margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center;">
-    <h1 style="color: var(--barn-red);">Strategic Management Dashboard 📊</h1>
-    <span style="font-size: 0.9rem; color: #666; font-weight: bold;">Welcome, Owner</span>
+<!-- ── PAGE HEADER ─────────────────────────────────────────── -->
+<div class="page-header">
+    <div>
+        <h2>📊 Management Dashboard</h2>
+        <p>Welcome back, <strong style="color:var(--gold);"><?php echo htmlspecialchars($_SESSION['username']); ?></strong> — here's your farm today.</p>
+    </div>
+    <span style="font-size:0.82rem; color:var(--text-muted); font-weight:600;">
+        <?php echo date('l, F j, Y'); ?>
+    </span>
 </div>
 
+<!-- ── PENDING ALERT ──────────────────────────────────────── -->
 <?php if ($pending_count > 0): ?>
-    <div class="card" style="background: #fff9db; border: 1px solid #fab005; border-left: 8px solid #fab005; margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center; padding: 15px 20px;">
-        <div>
-            <h4 style="margin: 0; color: #856404; display: flex; align-items: center;">
-                <span class="red-dot"></span> Action Required: Staff Requests
-            </h4>
-            <p style="margin: 5px 0 0; font-size: 0.9rem; color: #665c33;">
-                There are <strong><?php echo $pending_count; ?></strong> staff members requesting to correct their logs.
-            </p>
-        </div>
-        <a href="review_requests.php" class="btn-farm" style="background: #fab005; color: #000; padding: 10px 20px; text-decoration: none; font-weight: bold; border-radius: 5px; box-shadow: 0 3px 0 #c49000;">
-            Review Requests →
-        </a>
+<div class="alert-action">
+    <div>
+        <h4><span class="red-dot"></span>Action Required: Staff Edit Requests</h4>
+        <p><strong><?php echo $pending_count; ?></strong> staff member<?php echo $pending_count > 1 ? 's are' : ' is'; ?> requesting to correct their log entries.</p>
     </div>
+    <a href="review_requests.php" class="btn-farm btn-amber" style="white-space:nowrap;">Review Requests →</a>
+</div>
 <?php endif; ?>
 
-<div style="display: flex; gap: 20px; margin-bottom: 2rem; flex-wrap: wrap;">
-    <div class="card" style="flex: 1; border-top: 5px solid #28a745;">
-        <small style="font-weight: bold; color: #999;">REVENUE (THIS MONTH)</small>
-        <h2 style="margin-top: 10px;">₱ 45,200.00</h2>
-    </div>
-    <div class="card" style="flex: 1; border-top: 5px solid var(--accent-orange);">
-        <small style="font-weight: bold; color: #999;">ACTIVE BATCH</small>
-        <h2 style="margin-top: 10px;">Batch #24 - Lohmann</h2>
-    </div>
-    <div class="card" style="flex: 1; border-top: 5px solid var(--primary-yolk);">
-        <small style="font-weight: bold; color: #999;">AVG. DAILY YIELD</small>
-        <h2 style="margin-top: 10px;">88% Production</h2>
-    </div>
+
+<!-- ── OLD STOCK COMPLETED ALERT ─────────────────────────── -->
+<?php if ($completed_notif): ?>
+<div class="alert success" style="margin-bottom:1.2rem;">
+    🎉 Old stock cleared! Batch #<?php echo $completed_notif['batch_id']; ?>
+    (<?php echo htmlspecialchars($completed_notif['breed']); ?>) has been fully sold.
+    Staff completed the target on <?php echo date('M d, g:i A', strtotime($completed_notif['completed_at'])); ?>.
 </div>
+<?php endif; ?>
 
-<div style="display: grid; grid-template-columns: 2fr 1fr; gap: 25px;">
-    <div class="card">
-        <h3>Production Trends (Weekly)</h3>
-        <canvas id="productionChart" style="width:100%; max-height:300px;"></canvas>
+<!-- ── ACTIVE SELL-FIRST REMINDER ────────────────────────── -->
+<?php if ($sell_notif): ?>
+<div style="background:rgba(212,144,10,0.08); border:1px solid rgba(212,144,10,0.3);
+            border-left:4px solid var(--warning); border-radius:var(--radius);
+            padding:11px 16px; margin-bottom:1.2rem;
+            display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+    <div style="font-size:0.84rem; color:var(--text-secondary);">
+        ⏳ <strong style="color:var(--gold);">Sell-First Active:</strong>
+        Batch #<?php echo $sell_notif['batch_id']; ?>
+        (<?php echo htmlspecialchars($sell_notif['breed']); ?>) —
+        Target: <strong style="color:var(--gold);"><?php echo number_format($sell_notif['target_trays']); ?> trays</strong>
+        <span class="badge badge-<?php echo $sell_notif['status']==='unread' ? 'warning' : 'pending'; ?>"
+              style="margin-left:6px; font-size:0.6rem;">
+            <?php echo $sell_notif['status']==='unread' ? 'Not seen yet' : 'Seen by staff'; ?>
+        </span>
+    </div>
+    <a href="manage_flock/inventory.php" class="btn-farm btn-amber btn-sm" style="white-space:nowrap;">
+        View Inventory →
+    </a>
+</div>
+<?php endif; ?>
+
+<!-- ── STAT CARDS ─────────────────────────────────────────── -->
+<div style="display:flex; gap:16px; margin-bottom:2rem; flex-wrap:wrap;">
+
+    <div class="stat-card" style="border-top:3px solid var(--success);">
+        <div class="stat-label">Today's Harvest</div>
+        <div class="stat-value"><?php echo number_format($today_eggs); ?></div>
+        <div class="stat-sub">
+            <?php if ($harvest_diff > 0): ?>
+                <span style="color:var(--success);">▲ <?php echo number_format($harvest_diff); ?></span> vs yesterday
+            <?php elseif ($harvest_diff < 0): ?>
+                <span style="color:var(--danger);">▼ <?php echo number_format(abs($harvest_diff)); ?></span> vs yesterday
+            <?php else: ?>
+                Same as yesterday
+            <?php endif; ?>
+        </div>
     </div>
 
-    <div class="controls">
-        <h3 style="margin-bottom: 1rem;">Admin Actions</h3>
-        
-        <div style="display: flex; flex-direction: column; gap: 10px;">
-            <a href="manage_batches.php" class="btn-farm" style="text-align:center; background: var(--dark-nest);">📦 Manage Flock Batches</a>
-            <a href="manage_users.php" class="btn-farm" style="text-align:center; background: #555;">👥 Manage Farm Staff</a>
-            <a href="manage_prices.php" class="btn-farm" style="text-align:center; background: var(--accent-orange);">🏷️ Set Unit Pricing</a>
-            <a href="view_inventory.php" class="btn-farm" style="text-align:center; background: var(--barn-red);">🥚 Real-time Inventory</a>
-            <a href="view_history.php" class="btn-farm" style="text-align:center; background: #607d8b; border-bottom: 4px solid #455a64;">📜 View System History</a>
-            
-            <a href="review_requests.php" class="btn-farm" style="text-align:center; background: #f1f3f5; color: #495057; border: 1px solid #dee2e6; display: flex; align-items: center; justify-content: center;">
-                <?php if ($pending_count > 0): ?>
-                    <span class="sidebar-dot"></span>
+    <div class="stat-card" style="border-top:3px solid var(--gold);">
+        <div class="stat-label">This Month's Revenue</div>
+        <div class="stat-value" style="font-size:1.5rem;">₱<?php echo number_format($month_rev, 0); ?></div>
+        <div class="stat-sub">
+            <?php if ($rev_pct !== null): ?>
+                <?php if ($rev_pct >= 0): ?>
+                    <span style="color:var(--success);">▲ <?php echo $rev_pct; ?>%</span>
+                <?php else: ?>
+                    <span style="color:var(--danger);">▼ <?php echo abs($rev_pct); ?>%</span>
                 <?php endif; ?>
-                Review Edit Requests (<?php echo $pending_count; ?>)
-            </a>
-        </div>
-
-        <div class="card" style="margin-top: 20px; border-left: 5px solid var(--accent-orange); background: #fffcf9;">
-            <p style="font-size: 0.85rem;"><strong>Next Replacement:</strong><br>
-            Batch #24 is scheduled for replacement on <strong>Oct 2026</strong>.</p>
+                vs last month
+            <?php else: ?>
+                <?php echo date('F Y'); ?>
+            <?php endif; ?>
         </div>
     </div>
+
+    <div class="stat-card" style="border-top:3px solid var(--terra-lt);">
+        <div class="stat-label">Active Staff</div>
+        <div class="stat-value"><?php echo $staff_count; ?></div>
+        <div class="stat-sub">registered farm workers</div>
+    </div>
+
+    <div class="stat-card" style="border-top:3px solid var(--warning);">
+        <div class="stat-label">Pending Requests</div>
+        <div class="stat-value"><?php echo $pending_count; ?></div>
+        <div class="stat-sub">awaiting your review</div>
+    </div>
+
 </div>
 
+<!-- ── ROW 1: CHARTS ─────────────────────────────────────── -->
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:20px;">
+
+    <div class="card" style="padding:1.4rem 1.6rem;">
+        <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">🥚 Harvest — Last 7 Days</h3>
+        <canvas id="harvestChart" style="max-height:220px;"></canvas>
+    </div>
+
+    <div class="card" style="padding:1.4rem 1.6rem;">
+        <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">💰 Revenue — Last 6 Months</h3>
+        <canvas id="revenueChart" style="max-height:220px;"></canvas>
+    </div>
+
+</div>
+
+<!-- ── ROW 2: TOP CUSTOMERS + FLOCK HEALTH + ACTIONS ──────── -->
+<div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px; margin-bottom:20px;">
+
+    <!-- Top Customers -->
+    <div class="card" style="padding:1.4rem 1.6rem;">
+        <h3 style="font-size:0.92rem; margin-bottom:1.2rem;">🏆 Top Customers This Month</h3>
+        <?php if ($top_cust && $top_cust->num_rows > 0):
+            $rank = 1;
+            while ($c = $top_cust->fetch_assoc()):
+                $medal = match($rank) { 1 => '🥇', 2 => '🥈', 3 => '🥉', default => "#{$rank}" };
+        ?>
+        <div style="display:flex; justify-content:space-between; align-items:center;
+                    padding:9px 0; border-bottom:1px solid var(--border-subtle);">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <span style="font-size:1.1rem; min-width:24px;"><?php echo $medal; ?></span>
+                <div>
+                    <div style="font-weight:600; font-size:0.85rem; color:var(--text-primary);">
+                        <?php echo htmlspecialchars($c['customer_name']); ?>
+                    </div>
+                    <div style="font-size:0.72rem; color:var(--text-muted);">
+                        <?php echo $c['txn_count']; ?> orders · <?php echo number_format($c['trays']); ?> trays
+                    </div>
+                </div>
+            </div>
+            <span style="font-weight:700; font-size:0.85rem; color:var(--success);">
+                ₱<?php echo number_format((float)$c['total_spent'], 0); ?>
+            </span>
+        </div>
+        <?php $rank++; endwhile;
+        else: ?>
+        <div class="empty-state" style="padding:1.5rem 0;">
+            <span class="empty-icon">💰</span>
+            <p>No sales this month yet.</p>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- Flock Health Summary -->
+    <div class="card" style="padding:1.4rem 1.6rem;">
+        <h3 style="font-size:0.92rem; margin-bottom:1.2rem;">🐔 Active Flock Health</h3>
+        <?php if ($health_q && $health_q->num_rows > 0):
+            while ($row = $health_q->fetch_assoc()):
+                $badge_class = match($row['status_level']) {
+                    'Healthy'  => 'badge-healthy',
+                    'Warning'  => 'badge-warning',
+                    'Critical' => 'badge-critical',
+                    default    => 'badge-pending',
+                };
+        ?>
+        <div style="display:flex; justify-content:space-between; align-items:center;
+                    padding:9px 0; border-bottom:1px solid var(--border-subtle);">
+            <div>
+                <div style="font-weight:600; font-size:0.85rem; color:var(--text-primary);">
+                    Batch #<?php echo $row['batch_id']; ?> — <?php echo htmlspecialchars($row['breed']); ?>
+                </div>
+                <div style="font-size:0.72rem; color:var(--text-muted);">
+                    Mortality: <?php echo $row['mortality_count']; ?> ·
+                    <?php echo date('M d', strtotime($row['date_reported'])); ?>
+                </div>
+            </div>
+            <span class="badge <?php echo $badge_class; ?>"><?php echo $row['status_level']; ?></span>
+        </div>
+        <?php endwhile;
+        else: ?>
+        <div class="empty-state" style="padding:1.5rem 0;">
+            <span class="empty-icon">🐔</span>
+            <p>No health reports yet.</p>
+        </div>
+        <?php endif; ?>
+
+        <?php if ($nb && $days_left !== null): ?>
+        <div style="margin-top:14px; background:var(--bg-wood); border-left:3px solid
+                    <?php echo $days_left <= 30 ? 'var(--danger)' : 'var(--terra-lt)'; ?>;
+                    padding:10px 12px; border-radius:0 6px 6px 0;">
+            <div style="font-size:0.72rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:4px;">
+                Next Replacement
+            </div>
+            <div style="font-size:0.84rem; color:var(--text-primary);">
+                Batch #<?php echo $nb['batch_id']; ?> — <?php echo htmlspecialchars($nb['breed']); ?>
+            </div>
+            <div style="font-size:0.75rem; color:<?php echo $days_left <= 30 ? 'var(--danger)' : 'var(--text-muted)'; ?>; margin-top:3px;">
+                <?php echo date('M d, Y', strtotime($nb['expected_replacement'])); ?>
+                (<?php echo $days_left > 0 ? "in $days_left days" : 'Overdue!'; ?>)
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- Admin Quick Actions -->
+    <div>
+        <div style="font-size:0.7rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">
+            Quick Actions
+        </div>
+        <div style="display:flex; flex-direction:column; gap:7px;">
+            <a href="manage_flock/batches.php"  class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px;">📦 Flock Batches</a>
+            <a href="manage_flock/prices.php"   class="btn-farm btn-orange" style="text-align:center; font-size:0.85rem; padding:10px;">🏷️ Unit Pricing</a>
+            <a href="manage_flock/inventory.php"  class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px;">🥚 Inventory</a>
+
+            <div style="border-top:1px solid var(--border-subtle); margin:3px 0;"></div>
+            <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px;">Sales</div>
+
+            <a href="manage_sales/view_sales.php"   class="btn-farm btn-green" style="text-align:center; font-size:0.85rem; padding:10px;">💰 Sales History</a>
+            <a href="manage_sales/sales_report.php" class="btn-farm btn-green" style="text-align:center; font-size:0.85rem; padding:10px; background:#2d6b40;">📊 Sales Report</a>
+
+            <div style="border-top:1px solid var(--border-subtle); margin:3px 0;"></div>
+
+            <a href="logs/view_history.php"    class="btn-farm btn-gray"   style="text-align:center; font-size:0.85rem; padding:10px;">📜 Activity Log</a>
+            <a href="reports/review_requests.php" class="btn-farm btn-outline"
+               style="text-align:center; font-size:0.85rem; padding:10px; display:flex; align-items:center; justify-content:center; gap:6px;">
+                <?php if ($pending_count > 0): ?><span class="sidebar-dot"></span><?php endif; ?>
+                Manage Requests (<?php echo $pending_count; ?>)
+            </a>
+            <a href="manage_users/users.php"    class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px; background:var(--bg-plank);">👥 Farm Staff</a>
+        </div>
+    </div>
+
+</div>
+
+<!-- ── CHART SCRIPTS ─────────────────────────────────────── -->
 <script>
-const ctx = document.getElementById('productionChart').getContext('2d');
-new Chart(ctx, {
-    type: 'line',
+const chartDefaults = {
+    gridColor: 'rgba(232,168,56,0.06)',
+    tickColor: '#7A6E5E',
+    tooltipBg: '#2E2720',
+    tooltipText: '#F2EAD8',
+};
+
+// Chart 1 — Harvest (bar)
+new Chart(document.getElementById('harvestChart').getContext('2d'), {
+    type: 'bar',
     data: {
-        labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+        labels: <?php echo $js_labels; ?>,
         datasets: [{
-            label: 'Eggs Harvested',
-            data: [450, 480, 430, 500, 490, 510, 485],
-            borderColor: '#FF6B35',
-            backgroundColor: 'rgba(255, 107, 53, 0.1)',
-            fill: true,
-            tension: 0.4
+            label: 'Eggs',
+            data: <?php echo $js_data; ?>,
+            backgroundColor: 'rgba(232,168,56,0.18)',
+            borderColor: '#E8A838',
+            borderWidth: 2,
+            borderRadius: 5,
+            hoverBackgroundColor: 'rgba(232,168,56,0.35)',
         }]
     },
-    options: { 
+    options: {
         responsive: true,
         plugins: {
-            legend: { display: false }
+            legend: { display: false },
+            tooltip: {
+                backgroundColor: chartDefaults.tooltipBg,
+                titleColor: chartDefaults.tooltipText,
+                bodyColor: '#B8A88A',
+                callbacks: { label: c => ` ${c.parsed.y.toLocaleString()} eggs` }
+            }
+        },
+        scales: {
+            y: { beginAtZero:true, grid:{color:chartDefaults.gridColor}, ticks:{color:chartDefaults.tickColor, precision:0} },
+            x: { grid:{display:false}, ticks:{color:chartDefaults.tickColor} }
+        }
+    }
+});
+
+// Chart 2 — Revenue (line)
+new Chart(document.getElementById('revenueChart').getContext('2d'), {
+    type: 'line',
+    data: {
+        labels: <?php echo $js_rev_lbl; ?>,
+        datasets: [{
+            label: 'Revenue',
+            data: <?php echo $js_rev_data; ?>,
+            borderColor: '#4E9B5B',
+            backgroundColor: 'rgba(78,155,91,0.08)',
+            fill: true,
+            tension: 0.4,
+            pointBackgroundColor: '#4E9B5B',
+            pointRadius: 5,
+            pointHoverRadius: 7,
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            legend: { display: false },
+            tooltip: {
+                backgroundColor: chartDefaults.tooltipBg,
+                titleColor: chartDefaults.tooltipText,
+                bodyColor: '#B8A88A',
+                callbacks: { label: c => ` ₱${c.parsed.y.toLocaleString()}` }
+            }
+        },
+        scales: {
+            y: { beginAtZero:true, grid:{color:chartDefaults.gridColor}, ticks:{color:chartDefaults.tickColor, callback: v => '₱'+v.toLocaleString()} },
+            x: { grid:{display:false}, ticks:{color:chartDefaults.tickColor} }
         }
     }
 });
