@@ -62,7 +62,10 @@ $total_pages = max(1, ceil($total_rows / $per_page));
 
 // --- MAIN QUERY ---
 $sales = $conn->query("
-    SELECT s.*, u.username AS staff_name
+    SELECT s.*, u.username AS staff_name,
+           COALESCE(s.qty_pw,0) AS qty_pw, COALESCE(s.qty_s,0) AS qty_s,
+           COALESCE(s.qty_m,0) AS qty_m,  COALESCE(s.qty_l,0) AS qty_l,
+           COALESCE(s.qty_xl,0) AS qty_xl, COALESCE(s.qty_j,0) AS qty_j
     FROM sales s
     LEFT JOIN users u ON s.staff_id = u.user_id
     $where
@@ -162,6 +165,7 @@ function page_url($p, $from, $to, $method) {
                         <th>Staff</th>
                         <th>Customer</th>
                         <th>Trays</th>
+                        <th>Size Breakdown</th>
                         <th>Unit Price</th>
                         <th>Total</th>
                         <th>Payment</th>
@@ -186,6 +190,17 @@ function page_url($p, $from, $to, $method) {
                         <td style="font-size:0.84rem;"><?php echo htmlspecialchars($row['staff_name'] ?? '—'); ?></td>
                         <td><strong><?php echo htmlspecialchars($row['customer_name']); ?></strong></td>
                         <td style="text-align:center; font-weight:700;"><?php echo number_format($row['quantity_sold']); ?></td>
+                        <td style="font-family:monospace; font-size:0.75rem; color:var(--text-muted); white-space:nowrap; line-height:1.9;">
+                            <?php
+                            $bk = [];
+                            $szmap = ['PW'=>'qty_pw','S'=>'qty_s','M'=>'qty_m','L'=>'qty_l','XL'=>'qty_xl','J'=>'qty_j'];
+                            foreach ($szmap as $sz => $col) {
+                                $v = (int)($row[$col] ?? 0);
+                                if ($v > 0) $bk[] = "<span style='color:var(--text-primary);font-weight:700;'>$sz</span>&times;$v";
+                            }
+                            echo !empty($bk) ? implode(' &nbsp;', $bk) : '<span style="color:var(--text-muted)">—</span>';
+                            ?>
+                        </td>
                         <td>₱<?php echo number_format((float)$row['unit_price'], 2); ?></td>
                         <td style="font-weight:700; color:var(--success);">
                             ₱<?php echo number_format((float)$row['total_amount'], 2); ?>
@@ -210,7 +225,7 @@ function page_url($p, $from, $to, $method) {
                 <?php if ($total_rows > 0): ?>
                 <tfoot>
                     <tr>
-                        <td colspan="6" style="text-align:right; font-size:0.8rem;">Period Total</td>
+                        <td colspan="7" style="text-align:right; font-size:0.8rem;">Period Total</td>
                         <td style="color:var(--gold);">₱<?php echo number_format((float)$stats['total_revenue'], 2); ?></td>
                         <td colspan="2"></td>
                     </tr>

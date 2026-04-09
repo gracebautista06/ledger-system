@@ -113,18 +113,36 @@ $s_stmt->close();
         <div class="table-wrapper" style="border:none; border-radius:0;">
             <table class="table-farm">
                 <thead>
-                    <tr><th>Date</th><th>Customer</th><th>Trays</th><th>Unit Price</th><th>Total</th><th>Payment</th><th>Notes</th></tr>
+                    <tr><th>Date</th><th>Customer</th><th>Trays</th><th>Size Breakdown</th><th>Total</th><th>Payment</th><th>Notes</th></tr>
                 </thead>
                 <tbody>
                     <?php if ($sale_logs && $sale_logs->num_rows > 0):
-                        while ($row = $sale_logs->fetch_assoc()): ?>
+                        while ($row = $sale_logs->fetch_assoc()):
+                            $pm_icon = match($row['payment_method']) {
+                                'GCash'         => '📱',
+                                'Bank Transfer' => '🏦',
+                                default         => '💵',
+                            };
+                    ?>
                     <tr>
                         <td style="font-size:0.8rem; color:var(--text-muted); white-space:nowrap;"><?php echo date('M d, g:i A', strtotime($row['date_sold'])); ?></td>
                         <td><strong><?php echo htmlspecialchars($row['customer_name']); ?></strong></td>
                         <td style="text-align:center; font-weight:700;"><?php echo number_format($row['quantity_sold']); ?></td>
-                        <td>₱<?php echo number_format((float)$row['unit_price'], 2); ?></td>
+                        <td style="font-size:0.78rem; color:var(--text-muted); white-space:nowrap;">
+                            <?php
+                            $bk = [];
+                            $szmap = ['PW'=>'qty_pw','S'=>'qty_s','M'=>'qty_m','L'=>'qty_l','XL'=>'qty_xl','J'=>'qty_j'];
+                            foreach ($szmap as $sz => $col) {
+                                $v = (int)($row[$col] ?? 0);
+                                if ($v > 0) $bk[] = "<strong style='color:var(--text-primary);'>$sz</strong>&times;$v";
+                            }
+                            echo !empty($bk) ? implode(' ', $bk) : '<span style="color:var(--text-muted)">—</span>';
+                            ?>
+                        </td>
                         <td style="font-weight:700; color:var(--success);">₱<?php echo number_format((float)$row['total_amount'], 2); ?></td>
-                        <td style="font-size:0.82rem;"><?php echo htmlspecialchars($row['payment_method']); ?></td>
+                        <td style="font-size:0.82rem; white-space:nowrap;">
+                            <?php echo $pm_icon; ?> <?php echo htmlspecialchars($row['payment_method'] ?: '—'); ?>
+                        </td>
                         <td style="font-size:0.82rem; color:var(--text-muted); max-width:150px;"><?php echo htmlspecialchars($row['notes'] ?: '—'); ?></td>
                     </tr>
                     <?php endwhile; else: ?>

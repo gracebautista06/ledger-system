@@ -31,6 +31,16 @@ $stmt->execute();
 $my_pending = (int) $stmt->get_result()->fetch_assoc()['total'];
 $stmt->close();
 
+
+// Today's sales stats — shows trays sold today by this staff member
+$sales_stmt = $conn->prepare("SELECT COALESCE(SUM(quantity_sold),0) AS sold_today, COALESCE(SUM(total_amount),0) AS revenue_today FROM sales WHERE staff_id=? AND DATE(date_sold)=CURDATE()");
+$sales_stmt->bind_param("i", $staff_id);
+$sales_stmt->execute();
+$sales_today = $sales_stmt->get_result()->fetch_assoc();
+$sales_stmt->close();
+$trays_today   = (int) $sales_today['sold_today'];
+$revenue_today = (float) $sales_today['revenue_today'];
+
 // FIX: Include sell-first alert AFTER auth check, not before
 include('sell_first_alert.php');
 ?>
@@ -63,6 +73,15 @@ include('sell_first_alert.php');
         <!-- FIX: Visual progress bar toward 500-egg goal -->
         <div style="margin-top:10px; background:var(--bg-plank); border-radius:4px; height:6px; overflow:hidden;">
             <div style="width:<?php echo min(100, round(($logged_today / 500) * 100)); ?>%; background:var(--terra-lt); height:6px; border-radius:4px; transition:width 0.5s;"></div>
+        </div>
+    </div>
+    <div class="stat-card" style="border-left:5px solid var(--success); flex:1; min-width:180px;">
+        <div class="stat-label">Today's Sales</div>
+        <div class="stat-value"><?php echo number_format($trays_today); ?></div>
+        <div class="stat-sub">
+            <?php echo $trays_today > 0
+                ? 'Revenue: ₱' . number_format($revenue_today, 2)
+                : 'No sales logged yet'; ?>
         </div>
     </div>
 </div>
