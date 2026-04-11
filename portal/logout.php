@@ -12,6 +12,14 @@
 
 // Must start session before we can clear it
 session_start();
+// Log the logout BEFORE destroying the session (we need user_id and role)
+if (isset($_SESSION['user_id'], $_SESSION['role'])) {
+    // Minimal db connection just for logging
+    include('../includes/db.php');
+    include('../includes/log_activity.php');
+    log_activity($conn, $_SESSION['user_id'], $_SESSION['role'], 'Logout',
+        htmlspecialchars($_SESSION['username']) . ' logged out');
+}
 
 // 1. Clear all session variables from memory
 $_SESSION = [];

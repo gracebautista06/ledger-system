@@ -4,6 +4,8 @@ $page_title = 'Staff Dashboard';
 
 include('../includes/db.php');
 include('../includes/header.php');
+include('../includes/log_activity.php');
+include('../includes/notifications.php');
 
 // Auth check — session_start() is handled inside header.php
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
@@ -17,40 +19,48 @@ $staff_id = (int) $_SESSION['user_id'];
 $hour     = (int) date('H');
 $greeting = $hour < 12 ? 'Good Morning' : ($hour < 17 ? 'Good Afternoon' : 'Good Evening');
 
-// FIX: Prepared statement for today's harvest count
+// Today's harvest count
 $stmt = $conn->prepare("SELECT COALESCE(SUM(total_eggs),0) AS logged_today FROM harvests WHERE staff_id=? AND DATE(date_logged)=CURDATE()");
 $stmt->bind_param("i", $staff_id);
 $stmt->execute();
 $logged_today = (int) $stmt->get_result()->fetch_assoc()['logged_today'];
 $stmt->close();
 
-// FIX: Prepared statement for pending edit requests
+// Pending edit requests
 $stmt = $conn->prepare("SELECT COUNT(*) AS total FROM edit_requests WHERE staff_id=? AND status='Pending'");
 $stmt->bind_param("i", $staff_id);
 $stmt->execute();
 $my_pending = (int) $stmt->get_result()->fetch_assoc()['total'];
 $stmt->close();
 
-
-// Today's sales stats — shows trays sold today by this staff member
+// Today's sales stats
 $sales_stmt = $conn->prepare("SELECT COALESCE(SUM(quantity_sold),0) AS sold_today, COALESCE(SUM(total_amount),0) AS revenue_today FROM sales WHERE staff_id=? AND DATE(date_sold)=CURDATE()");
 $sales_stmt->bind_param("i", $staff_id);
 $sales_stmt->execute();
-$sales_today = $sales_stmt->get_result()->fetch_assoc();
+$sales_today   = $sales_stmt->get_result()->fetch_assoc();
 $sales_stmt->close();
 $trays_today   = (int) $sales_today['sold_today'];
 $revenue_today = (float) $sales_today['revenue_today'];
 
-// FIX: Include sell-first alert AFTER auth check, not before
-include('sell_first_alert.php');
+// sell_first_alert is intentionally NOT shown inline here anymore.
+// Staff sees it by clicking the bell → my_notifications.php
 ?>
 
-<div style="margin-bottom:2rem; animation:slideUp 0.5s ease-out;">
-    <h1 style="color:var(--gold); font-family:'Playfair Display',serif; font-size:1.9rem;">
-        <?php echo $greeting; ?>, <?php echo htmlspecialchars($username); ?>! 👩‍🌾
-    </h1>
-    <p style="color:var(--text-muted);">Ready to log today's farm activities? — <?php echo date('l, F j, Y'); ?></p>
+<!-- Page heading with notification bell -->
+<div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap;
+            gap:12px; margin-bottom:2rem; animation:slideUp 0.5s ease-out;">
+    <div>
+        <h1 style="color:var(--gold); font-family:'Playfair Display',serif; font-size:1.9rem;">
+            <?php echo $greeting; ?>, <?php echo htmlspecialchars($username); ?>! 👩‍🌾
+        </h1>
+        <p style="color:var(--text-muted);">Ready to log today's farm activities? — <?php echo date('l, F j, Y'); ?></p>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px; margin-top:4px;">
+        <?php render_notification_bell($conn, 'Staff'); ?>
+    </div>
 </div>
+
+<?php render_notification_panel($conn, 'Staff'); ?>
 
 <?php if ($my_pending > 0): ?>
 <div class="alert warning" style="margin-bottom:1.5rem;">
@@ -70,7 +80,6 @@ include('sell_first_alert.php');
         <div class="stat-label">You've Logged Today</div>
         <div class="stat-value"><?php echo number_format($logged_today); ?></div>
         <div class="stat-sub"><?php echo $logged_today >= 500 ? '🎉 Goal reached!' : number_format(max(0, 500 - $logged_today)) . ' to go'; ?></div>
-        <!-- FIX: Visual progress bar toward 500-egg goal -->
         <div style="margin-top:10px; background:var(--bg-plank); border-radius:4px; height:6px; overflow:hidden;">
             <div style="width:<?php echo min(100, round(($logged_today / 500) * 100)); ?>%; background:var(--terra-lt); height:6px; border-radius:4px; transition:width 0.5s;"></div>
         </div>

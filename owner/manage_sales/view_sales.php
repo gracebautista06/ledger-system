@@ -1,13 +1,16 @@
 <?php
 /* ============================================================
-   owner/view_sales.php — Full Sales History
-   - Filter by date range and payment method
-   - Summary stats (total revenue, total trays, avg per sale)
-   - Pagination (20 per page)
-   - Link to export
+   owner/view_sales.php — Today's Sales Dashboard
+   - Shows ONLY today's transactions
+   - End-of-day snapshot: revenue, trays, transactions, avg
+   - vs-yesterday comparison on revenue
+   - Payment method breakdown for the day
+   - Per-staff sales summary for the day
+   - Full today transaction list with export buttons
+   - Link to sales_report.php for full history & exports
    ============================================================ */
 
-$page_title = 'Sales History';
+$page_title = "Today's Sales";
 
 session_start();
 include('../../includes/db.php');
@@ -18,141 +21,214 @@ if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Owner') {
     exit();
 }
 
-// --- FILTERS ---
-$allowed_methods = ['all', 'Cash', 'GCash', 'Bank Transfer'];
-$filter_method   = (isset($_GET['method']) && in_array($_GET['method'], $allowed_methods))
-                   ? $_GET['method'] : 'all';
+$today     = date('Y-m-d');
+$today_fmt = date('l, F j, Y');
 
-$date_from = !empty($_GET['from']) ? $_GET['from'] : date('Y-m-01');      // First of current month
-$date_to   = !empty($_GET['to'])   ? $_GET['to']   : date('Y-m-d');       // Today
-
-// Sanitize dates
-$date_from = date('Y-m-d', strtotime($date_from));
-$date_to   = date('Y-m-d', strtotime($date_to));
-
-// Build WHERE
-$where_parts = ["DATE(s.date_sold) BETWEEN '$date_from' AND '$date_to'"];
-if ($filter_method !== 'all') {
-    $safe_method  = $conn->real_escape_string($filter_method);
-    $where_parts[] = "s.payment_method = '$safe_method'";
-}
-$where = 'WHERE ' . implode(' AND ', $where_parts);
-
-// --- SUMMARY STATS for the filtered period ---
+// ── TODAY'S SUMMARY ──────────────────────────────────────────────
 $stats_q = $conn->query("
     SELECT
-        COUNT(*)                    AS total_transactions,
-        COALESCE(SUM(s.quantity_sold* 30), 0) AS total_eggs_sold,
-        COALESCE(SUM(s.total_amount), 0)       AS total_revenue,
-        COALESCE(AVG(s.total_amount), 0)       AS avg_sale,
-        COALESCE(SUM(s.quantity_sold), 0)      AS total_trays
-    FROM sales s
-    $where
+        COUNT(*)                          AS total_transactions,
+        COALESCE(SUM(quantity_sold),   0) AS total_trays,
+        COALESCE(SUM(quantity_sold*30),0) AS total_eggs,
+        COALESCE(SUM(total_amount),    0) AS total_revenue,
+        COALESCE(AVG(total_amount),    0) AS avg_per_sale,
+        COALESCE(MAX(total_amount),    0) AS biggest_sale
+    FROM sales
+    WHERE DATE(date_sold) = '$today'
 ");
-$stats = $stats_q ? $stats_q->fetch_assoc() : [];
+$stats     = $stats_q ? $stats_q->fetch_assoc() : [];
+$today_rev = (float)($stats['total_revenue'] ?? 0);
+$total_tx  = (int)($stats['total_transactions'] ?? 0);
 
-// --- PAGINATION ---
-$per_page     = 20;
-$current_page = max(1, intval($_GET['page'] ?? 1));
-$offset       = ($current_page - 1) * $per_page;
+// ── YESTERDAY COMPARISON ─────────────────────────────────────────
+$yest_q   = $conn->query("SELECT COALESCE(SUM(total_amount),0) AS rev FROM sales WHERE DATE(date_sold)=DATE_SUB('$today',INTERVAL 1 DAY)");
+$yest_rev = $yest_q ? (float)$yest_q->fetch_assoc()['rev'] : 0;
+$rev_diff = $today_rev - $yest_rev;
+$rev_pct  = $yest_rev > 0 ? round(($rev_diff / $yest_rev) * 100, 1) : null;
 
-$count_q    = $conn->query("SELECT COUNT(*) AS total FROM sales s $where");
-$total_rows = $count_q ? (int)$count_q->fetch_assoc()['total'] : 0;
-$total_pages = max(1, ceil($total_rows / $per_page));
+// ── PAYMENT METHOD BREAKDOWN ─────────────────────────────────────
+$payment_q = $conn->query("
+    SELECT payment_method, COUNT(*) AS cnt,
+           SUM(total_amount) AS total, SUM(quantity_sold) AS trays
+    FROM sales
+    WHERE DATE(date_sold)='$today'
+    GROUP BY payment_method ORDER BY total DESC
+");
+$payment_rows = [];
+if ($payment_q) while ($r = $payment_q->fetch_assoc()) $payment_rows[] = $r;
 
-// --- MAIN QUERY ---
-$sales = $conn->query("
-    SELECT s.*, u.username AS staff_name,
-           COALESCE(s.qty_pw,0) AS qty_pw, COALESCE(s.qty_s,0) AS qty_s,
-           COALESCE(s.qty_m,0) AS qty_m,  COALESCE(s.qty_l,0) AS qty_l,
-           COALESCE(s.qty_xl,0) AS qty_xl, COALESCE(s.qty_j,0) AS qty_j
-    FROM sales s
-    LEFT JOIN users u ON s.staff_id = u.user_id
-    $where
+// ── PER-STAFF SUMMARY ────────────────────────────────────────────
+$staff_q = $conn->query("
+    SELECT u.username, COUNT(s.sale_id) AS transactions,
+           SUM(s.quantity_sold) AS trays, SUM(s.total_amount) AS revenue
+    FROM sales s JOIN users u ON s.staff_id=u.user_id
+    WHERE DATE(s.date_sold)='$today'
+    GROUP BY s.staff_id, u.username ORDER BY revenue DESC
+");
+$staff_rows = [];
+if ($staff_q) while ($r = $staff_q->fetch_assoc()) $staff_rows[] = $r;
+
+// ── TODAY'S TRANSACTIONS ─────────────────────────────────────────
+$sales_q = $conn->query("
+    SELECT s.*, u.username AS staff_name
+    FROM sales s LEFT JOIN users u ON s.staff_id=u.user_id
+    WHERE DATE(s.date_sold)='$today'
     ORDER BY s.date_sold DESC
-    LIMIT $per_page OFFSET $offset
 ");
-
-// Build pagination URL helper
-function page_url($p, $from, $to, $method) {
-    return "?page=$p&from=" . urlencode($from) . "&to=" . urlencode($to) . "&method=" . urlencode($method);
-}
 ?>
 
-<div style="max-width:1100px; margin:2rem auto;">
+<div style="max-width:1080px; margin:2rem auto;">
 
     <div class="page-header">
         <div>
-            <h2>💰 Sales History</h2>
-            <p>All recorded egg sales — filter by date range and payment method.</p>
+            <h2>💰 Today's Sales</h2>
+            <p><?php echo $today_fmt; ?> — end-of-day snapshot</p>
         </div>
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <a href="export_sales.php?from=<?php echo urlencode($date_from); ?>&to=<?php echo urlencode($date_to); ?>&method=<?php echo urlencode($filter_method); ?>&format=excel"
-               class="btn-farm btn-green btn-sm">⬇ Export Excel</a>
-            <a href="export_sales.php?from=<?php echo urlencode($date_from); ?>&to=<?php echo urlencode($date_to); ?>&method=<?php echo urlencode($filter_method); ?>&format=pdf"
-               class="btn-farm btn-danger btn-sm">⬇ Export PDF</a>
+            <a href="sales_report.php" class="btn-farm btn-dark btn-sm">📊 Full History & Reports →</a>
             <a href="../dashboard.php" class="back-link" style="margin:0;">← Dashboard</a>
         </div>
     </div>
 
-    <!-- FILTER FORM -->
-    <div class="card" style="margin-bottom:1.5rem; padding:1.4rem 1.8rem;">
-        <form method="GET" style="display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;">
-            <div class="form-group" style="margin:0; flex:1; min-width:140px;">
-                <label>From</label>
-                <input type="date" name="from" class="form-input" value="<?php echo $date_from; ?>">
-            </div>
-            <div class="form-group" style="margin:0; flex:1; min-width:140px;">
-                <label>To</label>
-                <input type="date" name="to" class="form-input" value="<?php echo $date_to; ?>">
-            </div>
-            <div class="form-group" style="margin:0; flex:1; min-width:160px;">
-                <label>Payment Method</label>
-                <select name="method" class="form-input">
-                    <?php foreach (['all' => 'All Methods', 'Cash' => '💵 Cash', 'GCash' => '📱 GCash', 'Bank Transfer' => '🏦 Bank Transfer'] as $val => $label): ?>
-                        <option value="<?php echo $val; ?>" <?php echo $filter_method === $val ? 'selected' : ''; ?>>
-                            <?php echo $label; ?>
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-            <div style="padding-bottom:1px;">
-                <button type="submit" class="btn-farm btn-sm">🔍 Filter</button>
-                <a href="view_sales.php" class="btn-farm btn-dark btn-sm" style="margin-left:6px;">✕ Reset</a>
-            </div>
-        </form>
-    </div>
+    <!-- ── SNAPSHOT CARDS ───────────────────────────────────────── -->
+    <div style="display:flex; gap:16px; margin-bottom:2rem; flex-wrap:wrap;">
 
-    <!-- SUMMARY STAT CARDS -->
-    <div style="display:flex; gap:16px; margin-bottom:1.8rem; flex-wrap:wrap;">
-        <div class="stat-card" style="border-top:4px solid var(--success);">
-            <div class="stat-label">Total Revenue</div>
-            <div class="stat-value">₱<?php echo number_format((float)$stats['total_revenue'], 2); ?></div>
-            <div class="stat-sub"><?php echo date('M d', strtotime($date_from)); ?> – <?php echo date('M d', strtotime($date_to)); ?></div>
+        <div class="stat-card" style="border-top:4px solid var(--success); flex:2; min-width:200px;">
+            <div class="stat-label">Today's Revenue</div>
+            <div class="stat-value" style="font-size:2.3rem; color:var(--success);">
+                ₱<?php echo number_format($today_rev, 2); ?>
+            </div>
+            <div class="stat-sub" style="margin-top:8px;">
+                <?php if ($rev_pct !== null): ?>
+                    <span style="color:<?php echo $rev_diff>=0?'var(--success)':'var(--danger)'; ?>; font-weight:700;">
+                        <?php echo $rev_diff>=0?'▲':'▼'; ?> <?php echo abs($rev_pct); ?>%
+                    </span>
+                    vs yesterday &nbsp;(₱<?php echo number_format($yest_rev,2); ?>)
+                <?php elseif ($yest_rev == 0 && $today_rev > 0): ?>
+                    <span style="color:var(--text-muted);">No sales yesterday to compare</span>
+                <?php else: ?>
+                    <span style="color:var(--text-muted);">No sales recorded today yet</span>
+                <?php endif; ?>
+            </div>
         </div>
+
         <div class="stat-card" style="border-top:4px solid var(--gold);">
             <div class="stat-label">Transactions</div>
-            <div class="stat-value"><?php echo number_format((int)$stats['total_transactions']); ?></div>
-            <div class="stat-sub">sales recorded</div>
+            <div class="stat-value"><?php echo number_format($total_tx); ?></div>
+            <div class="stat-sub">sales today</div>
         </div>
+
         <div class="stat-card" style="border-top:4px solid var(--terra-lt);">
             <div class="stat-label">Trays Sold</div>
-            <div class="stat-value"><?php echo number_format((int)$stats['total_trays']); ?></div>
-            <div class="stat-sub"><?php echo number_format((int)$stats['total_eggs_sold']); ?> eggs total</div>
+            <div class="stat-value"><?php echo number_format((int)($stats['total_trays']??0)); ?></div>
+            <div class="stat-sub"><?php echo number_format((int)($stats['total_eggs']??0)); ?> eggs</div>
         </div>
+
         <div class="stat-card" style="border-top:4px solid var(--info);">
             <div class="stat-label">Avg. Per Sale</div>
-            <div class="stat-value">₱<?php echo number_format((float)$stats['avg_sale'], 2); ?></div>
-            <div class="stat-sub">average transaction</div>
+            <div class="stat-value">₱<?php echo number_format((float)($stats['avg_per_sale']??0),2); ?></div>
+            <div class="stat-sub">
+                Biggest: ₱<?php echo number_format((float)($stats['biggest_sale']??0),2); ?>
+            </div>
         </div>
+
     </div>
 
-    <!-- SALES TABLE -->
+    <?php if ($total_tx === 0): ?>
+    <!-- EMPTY STATE -->
+    <div class="card" style="text-align:center; padding:4rem 2rem;">
+        <div style="font-size:3.5rem; margin-bottom:1rem; opacity:0.3;">💰</div>
+        <h3 style="color:var(--text-secondary); margin-bottom:0.5rem;">No sales recorded today yet.</h3>
+        <p style="color:var(--text-muted); font-size:0.9rem;">
+            Once staff log sales for <?php echo date('F j'); ?>, they'll appear here instantly.
+        </p>
+        <a href="sales_report.php" class="btn-farm btn-dark btn-sm" style="display:inline-block; margin-top:1.5rem;">
+            View Past Sales →
+        </a>
+    </div>
+
+    <?php else: ?>
+
+    <!-- ── BREAKDOWN: PAYMENT + STAFF ──────────────────────────── -->
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:24px;">
+
+        <!-- Payment Method -->
+        <div class="card" style="padding:1.4rem 1.6rem;">
+            <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">💳 By Payment Method</h3>
+            <?php
+            $method_colors = ['Cash'=>'var(--success)','GCash'=>'var(--info)','Bank Transfer'=>'var(--gold)'];
+            foreach ($payment_rows as $pm):
+                $pct   = $today_rev>0 ? round(((float)$pm['total']/$today_rev)*100,1) : 0;
+                $color = $method_colors[$pm['payment_method']] ?? 'var(--text-muted)';
+                $icon  = match($pm['payment_method']) { 'GCash'=>'📱','Bank Transfer'=>'🏦',default=>'💵' };
+            ?>
+            <div style="margin-bottom:1.1rem;">
+                <div style="display:flex; justify-content:space-between; font-size:0.84rem; margin-bottom:5px;">
+                    <span style="font-weight:600; color:var(--text-primary);">
+                        <?php echo $icon; ?> <?php echo htmlspecialchars($pm['payment_method']); ?>
+                    </span>
+                    <span style="color:var(--text-muted);">
+                        <?php echo $pm['cnt']; ?> sale<?php echo $pm['cnt']>1?'s':''; ?>
+                        &nbsp;·&nbsp;
+                        <strong style="color:var(--success);">₱<?php echo number_format((float)$pm['total'],2); ?></strong>
+                    </span>
+                </div>
+                <div style="background:var(--bg-wood); border-radius:4px; height:8px;">
+                    <div style="width:<?php echo $pct; ?>%; background:<?php echo $color; ?>; height:8px; border-radius:4px;"></div>
+                </div>
+                <div style="font-size:0.7rem; color:var(--text-muted); margin-top:3px;">
+                    <?php echo $pct; ?>% of today's revenue
+                    &nbsp;·&nbsp; <?php echo number_format((int)$pm['trays']); ?> tray<?php echo $pm['trays']>1?'s':''; ?>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <!-- Per-Staff Summary -->
+        <div class="card" style="padding:1.4rem 1.6rem;">
+            <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">👤 Sales by Staff</h3>
+            <div class="table-wrapper" style="border:none;">
+                <table class="table-farm" style="font-size:0.84rem;">
+                    <thead>
+                        <tr>
+                            <th>Staff</th>
+                            <th style="text-align:center;">Sales</th>
+                            <th style="text-align:center;">Trays</th>
+                            <th style="text-align:right;">Revenue</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($staff_rows as $sr): ?>
+                        <tr>
+                            <td><strong><?php echo htmlspecialchars($sr['username']); ?></strong></td>
+                            <td style="text-align:center; color:var(--text-muted);"><?php echo $sr['transactions']; ?></td>
+                            <td style="text-align:center; color:var(--text-muted);"><?php echo number_format((int)$sr['trays']); ?></td>
+                            <td style="text-align:right; font-weight:700; color:var(--success);">
+                                ₱<?php echo number_format((float)$sr['revenue'],2); ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <td colspan="3" style="text-align:right;">Total</td>
+                            <td style="text-align:right; color:var(--gold);">₱<?php echo number_format($today_rev,2); ?></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ── TODAY'S TRANSACTION LIST ─────────────────────────────── -->
     <div class="card" style="padding:0; overflow:hidden;">
-        <div style="padding:1.4rem 1.8rem 1rem; border-bottom:1px solid var(--border-subtle);">
-            <h3 style="margin:0;">Transaction Log
-                <span style="font-size:0.78rem; font-weight:500; color:var(--text-muted); margin-left:10px;">
-                    <?php echo number_format($total_rows); ?> record<?php echo $total_rows !== 1 ? 's' : ''; ?> found
+        <div style="padding:1.2rem 1.6rem; border-bottom:1px solid var(--border-subtle);
+                    display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <h3 style="margin:0;">
+                📋 All Transactions Today
+                <span style="font-size:0.78rem; font-weight:500; color:var(--text-muted); margin-left:8px;">
+                    <?php echo $total_tx; ?> record<?php echo $total_tx!==1?'s':''; ?>
                 </span>
             </h3>
         </div>
@@ -161,104 +237,75 @@ function page_url($p, $from, $to, $method) {
                 <thead>
                     <tr>
                         <th>#</th>
-                        <th>Date & Time</th>
+                        <th>Time</th>
                         <th>Staff</th>
                         <th>Customer</th>
-                        <th>Trays</th>
-                        <th>Size Breakdown</th>
-                        <th>Unit Price</th>
-                        <th>Total</th>
+                        <th style="text-align:center;">Trays</th>
+                        <th style="text-align:right;">Unit Price</th>
+                        <th style="text-align:right;">Total</th>
                         <th>Payment</th>
                         <th>Notes</th>
                     </tr>
                 </thead>
                 <tbody>
-                    <?php if ($sales && $sales->num_rows > 0):
-                        while ($row = $sales->fetch_assoc()):
-                            $method_icon = match($row['payment_method']) {
-                                'GCash'        => '📱',
-                                'Bank Transfer'=> '🏦',
-                                default        => '💵',
-                            };
+                    <?php while ($row = $sales_q->fetch_assoc()):
+                        $icon = match($row['payment_method']) { 'GCash'=>'📱','Bank Transfer'=>'🏦',default=>'💵' };
                     ?>
                     <tr>
-                        <td style="color:var(--text-muted); font-size:0.78rem;">#<?php echo $row['sale_id']; ?></td>
-                        <td style="font-size:0.8rem; color:var(--text-muted); white-space:nowrap;">
-                            <?php echo date('M d, Y', strtotime($row['date_sold'])); ?><br>
-                            <span style="font-size:0.73rem;"><?php echo date('g:i A', strtotime($row['date_sold'])); ?></span>
+                        <td style="color:var(--text-muted); font-size:0.75rem;">#<?php echo $row['sale_id']; ?></td>
+                        <td style="font-size:0.82rem; color:var(--text-muted); white-space:nowrap;">
+                            <?php echo date('g:i A', strtotime($row['date_sold'])); ?>
                         </td>
-                        <td style="font-size:0.84rem;"><?php echo htmlspecialchars($row['staff_name'] ?? '—'); ?></td>
+                        <td style="font-size:0.84rem; color:var(--text-secondary);">
+                            <?php echo htmlspecialchars($row['staff_name'] ?? '—'); ?>
+                        </td>
                         <td><strong><?php echo htmlspecialchars($row['customer_name']); ?></strong></td>
                         <td style="text-align:center; font-weight:700;"><?php echo number_format($row['quantity_sold']); ?></td>
-                        <td style="font-family:monospace; font-size:0.75rem; color:var(--text-muted); white-space:nowrap; line-height:1.9;">
-                            <?php
-                            $bk = [];
-                            $szmap = ['PW'=>'qty_pw','S'=>'qty_s','M'=>'qty_m','L'=>'qty_l','XL'=>'qty_xl','J'=>'qty_j'];
-                            foreach ($szmap as $sz => $col) {
-                                $v = (int)($row[$col] ?? 0);
-                                if ($v > 0) $bk[] = "<span style='color:var(--text-primary);font-weight:700;'>$sz</span>&times;$v";
-                            }
-                            echo !empty($bk) ? implode(' &nbsp;', $bk) : '<span style="color:var(--text-muted)">—</span>';
-                            ?>
+                        <td style="text-align:right; color:var(--text-muted); font-size:0.85rem;">
+                            ₱<?php echo number_format((float)$row['unit_price'],2); ?>
                         </td>
-                        <td>₱<?php echo number_format((float)$row['unit_price'], 2); ?></td>
-                        <td style="font-weight:700; color:var(--success);">
-                            ₱<?php echo number_format((float)$row['total_amount'], 2); ?>
+                        <td style="text-align:right; font-weight:700; color:var(--success);">
+                            ₱<?php echo number_format((float)$row['total_amount'],2); ?>
                         </td>
-                        <td>
-                            <span style="font-size:0.82rem;"><?php echo $method_icon; ?> <?php echo htmlspecialchars($row['payment_method']); ?></span>
+                        <td style="font-size:0.82rem; white-space:nowrap;">
+                            <?php echo $icon; ?> <?php echo htmlspecialchars($row['payment_method']); ?>
                         </td>
-                        <td style="font-size:0.8rem; color:var(--text-muted); max-width:160px;">
+                        <td style="font-size:0.78rem; color:var(--text-muted); max-width:150px;">
                             <?php echo htmlspecialchars($row['notes'] ?: '—'); ?>
                         </td>
                     </tr>
-                    <?php endwhile; else: ?>
-                    <tr><td colspan="9">
-                        <div class="empty-state">
-                            <span class="empty-icon">💰</span>
-                            <p>No sales found for this period.</p>
-                            <small>Try adjusting your date range or filters.</small>
-                        </div>
-                    </td></tr>
-                    <?php endif; ?>
+                    <?php endwhile; ?>
                 </tbody>
-                <?php if ($total_rows > 0): ?>
                 <tfoot>
                     <tr>
-                        <td colspan="7" style="text-align:right; font-size:0.8rem;">Period Total</td>
-                        <td style="color:var(--gold);">₱<?php echo number_format((float)$stats['total_revenue'], 2); ?></td>
+                        <td colspan="4" style="text-align:right; font-size:0.8rem; color:var(--text-muted);">
+                            Day Total
+                        </td>
+                        <td style="text-align:center; font-weight:700; color:var(--gold);">
+                            <?php echo number_format((int)$stats['total_trays']); ?> trays
+                        </td>
+                        <td></td>
+                        <td style="text-align:right; font-weight:800; color:var(--gold);">
+                            ₱<?php echo number_format($today_rev, 2); ?>
+                        </td>
                         <td colspan="2"></td>
                     </tr>
                 </tfoot>
-                <?php endif; ?>
             </table>
         </div>
-
-        <!-- PAGINATION -->
-        <?php if ($total_pages > 1): ?>
-        <div style="display:flex; justify-content:center; gap:6px; padding:1.2rem; flex-wrap:wrap;">
-            <?php if ($current_page > 1): ?>
-                <a href="<?php echo page_url($current_page - 1, $date_from, $date_to, $filter_method); ?>"
-                   class="btn-farm btn-dark btn-sm">← Prev</a>
-            <?php endif; ?>
-            <?php
-            $start = max(1, $current_page - 2);
-            $end   = min($total_pages, $current_page + 2);
-            for ($p = $start; $p <= $end; $p++): ?>
-                <a href="<?php echo page_url($p, $date_from, $date_to, $filter_method); ?>"
-                   class="btn-farm btn-sm <?php echo $p === $current_page ? '' : 'btn-dark'; ?>">
-                    <?php echo $p; ?>
-                </a>
-            <?php endfor; ?>
-            <?php if ($current_page < $total_pages): ?>
-                <a href="<?php echo page_url($current_page + 1, $date_from, $date_to, $filter_method); ?>"
-                   class="btn-farm btn-dark btn-sm">Next →</a>
-            <?php endif; ?>
-        </div>
-        <?php endif; ?>
     </div>
 
-    <a href="../dashboard.php" class="back-link">← Back to Dashboard</a>
+    <?php endif; ?>
+
+    <div style="margin-top:1.5rem; display:flex; justify-content:space-between;
+                align-items:center; flex-wrap:wrap; gap:10px;">
+        <a href="../dashboard.php" class="back-link">← Back to Dashboard</a>
+        <a href="sales_report.php"
+           style="font-size:0.84rem; color:var(--gold); text-decoration:none; font-weight:600;">
+            Need full history? → Sales Report & Export
+        </a>
+    </div>
+
 </div>
 
 <?php include('../../includes/footer.php'); ?>

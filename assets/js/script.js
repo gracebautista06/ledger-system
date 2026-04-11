@@ -1,13 +1,3 @@
-/* ============================================================
-   script.js — Egg Ledger System Global Scripts
-   IMPROVEMENTS:
-   - Auto-dismiss alerts after 5 seconds
-   - Active nav link highlighting
-   - Form double-submit prevention
-   - Numeric input sanitizer (no negatives)
-   - Global confirmAction() helper for delete buttons
-   - show/hide password toggle (togglePassword) shared globally
-   ============================================================ */
 
 document.addEventListener('DOMContentLoaded', function () {
 
@@ -85,3 +75,66 @@ function togglePassword(inputId, iconId) {
     input.type       = input.type === 'password' ? 'text' : 'password';
     icon.textContent = input.type === 'password' ? '👁️' : '🙈';
 }
+
+function toggleAddPanel() {
+    const p = document.getElementById('add-panel');
+    if (!p) return;
+
+    const isHidden = getComputedStyle(p).display === 'none';
+    p.style.display = isHidden ? 'block' : 'none';
+
+    if (isHidden) {
+        const input = p.querySelector('input[name="new_username"]');
+        if (input) input.focus();
+    }
+}
+
+
+// 🔵 LIVE STATUS FUNCTION
+function refreshStatus() {
+    fetch('fetch_status.php')
+        .then(res => res.json())
+        .then(data => {
+            Object.keys(data).forEach(userId => {
+                const cell = document.getElementById('status-' + userId);
+                if (!cell) return;
+
+                const user = data[userId];
+
+                let html = '';
+
+                if (user.is_online === 1) {
+                    html = `
+                        <div style="display:flex; align-items:center; gap:7px;">
+                            <span style="width:9px; height:9px; border-radius:50%;
+                                background:var(--success);
+                                animation:pulse-online 2s infinite;"></span>
+                            <span style="font-size:0.82rem; font-weight:700; color:var(--success);">
+                                Active now
+                            </span>
+                        </div>`;
+                } else {
+                    html = `<span style="font-size:0.8rem; color:var(--text-muted);">Offline</span>`;
+                }
+
+                cell.innerHTML = html;
+            });
+        })
+        .catch(() => {});
+}
+
+
+// 🔄 RUN STATUS UPDATE EVERY 10s
+setInterval(refreshStatus, 10000);
+
+
+// 💓 HEARTBEAT EVERY 30s
+setInterval(() => {
+    fetch('heartbeat.php').catch(() => {});
+}, 30000);
+
+
+// 🚪 LOGOUT DETECTION
+window.addEventListener('beforeunload', () => {
+    navigator.sendBeacon('logout_ping.php');
+});

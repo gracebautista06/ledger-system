@@ -4,6 +4,7 @@ $page_title = 'Log Harvest';
 
 include('../includes/db.php');
 include('../includes/header.php');
+include('../includes/log_activity.php');
 
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
     header("Location: ../portal/login.php"); exit();
@@ -11,7 +12,6 @@ if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
 
 $message = "";
 
-// FIX: Prepared statement for batch fetch
 $batch_stmt = $conn->prepare("SELECT batch_id, breed FROM batches WHERE status='Active' ORDER BY batch_id ASC");
 $batch_stmt->execute();
 $batch_query = $batch_stmt->get_result();
@@ -27,10 +27,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $j   = max(0, (int) ($_POST['size_j']  ?? 0));
     $notes = trim($_POST['notes'] ?? '');
 
-    // Server calculates total — don't trust posted value
     $calculated_total = $pw + $s + $m + $l + $xl + $j;
 
-    // FIX: Validate batch with prepared statement
     $check = $conn->prepare("SELECT batch_id FROM batches WHERE batch_id=? AND status='Active' LIMIT 1");
     $check->bind_param("i", $batch_id);
     $check->execute();
@@ -43,11 +41,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     } elseif ($calculated_total === 0) {
         $message = "<div class='alert error'>⚠️ Please enter at least one egg count before submitting.</div>";
     } else {
-        // FIX: Full prepared statement insert
         $ins = $conn->prepare("INSERT INTO harvests (staff_id, batch_id, total_eggs, size_pw, size_s, size_m, size_l, size_xl, size_j, notes) VALUES (?,?,?,?,?,?,?,?,?,?)");
         $ins->bind_param("iiiiiiiiss", $staff_id, $batch_id, $calculated_total, $pw, $s, $m, $l, $xl, $j, $notes);
         if ($ins->execute()) {
+            $harvest_id = $conn->insert_id;
             $ins->close();
+            // Log activity
+            log_activity($conn, $staff_id, 'Staff', 'Harvest Added',
+                "Logged {$calculated_total} eggs for Batch #{$batch_id} (Harvest #{$harvest_id})");
             header("Location: view_logs.php?harvest_saved=1"); exit();
         } else {
             $message = "<div class='alert error'>Database error. Please try again.</div>";

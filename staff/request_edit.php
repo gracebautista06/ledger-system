@@ -4,6 +4,7 @@ $page_title = 'Request Edit';
 
 include('../includes/db.php');
 include('../includes/header.php');
+include('../includes/log_activity.php');
 
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
     header("Location: ../portal/login.php"); exit();
@@ -56,6 +57,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && !$already_pending) {
         $ins->bind_param("isiss", $staff_id, $type, $id, $new_data, $reason);
         if ($ins->execute()) {
             $ins->close();
+            log_session_activity($conn, 'Edit Request Sent', "Requested edit on  # — reason: $reason");
             header("Location: view_logs.php?request_sent=1"); exit();
         } else {
             $message = "<div class='alert error'>Database error. Please try again.</div>";

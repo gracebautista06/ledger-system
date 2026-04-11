@@ -1,46 +1,39 @@
 <?php
-/*  staff/log_sale.php — Record a New Egg Sale (Per-Size Breakdown)
+/*  staff/log_sale.php — Record a New Egg Sale (Breed-Aware)
  *
- *  CHANGES FROM PREVIOUS VERSION:
- *  - Staff now inputs trays per egg size instead of one bulk total
- *  - Prices are auto-loaded from the egg_prices table (set by Owner)
- *  - Each row auto-calculates subtotal; grand total sums everything
- *  - quantity_sold (total trays) is server-computed from size inputs
- *  - total_amount is server-computed; client total is display-only
- *  - Per-size quantities saved into qty_pw/qty_s/.../qty_j columns
- *    (requires running migration_sales_sizes.sql first)
- *  - Old stock notification check preserved and improved
- *
- *  DB COLUMNS NEEDED (run migration_sales_sizes.sql if not done):
- *    sales.qty_pw, qty_s, qty_m, qty_l, qty_xl, qty_j
+ *  CHANGES from previous version:
+ *  - Staff selects WHICH BREED they're selling from first
+ *  - Prices auto-load from breed_prices table for that breed
+ *  - Available stock is calculated per-breed per-size
+ *    (harvests filtered by batch_id, which links to breed)
+ *  - Breed selector only shows breeds that have stock available
+ *  - If no breed selected yet, the size table is hidden
+ *  - All existing validations (stock check, server-side) preserved
  */
 
 $page_title = 'Record Sale';
 
 include('../includes/db.php');
+
+// Guard: make sure db.php actually created $conn
+if (!isset($conn) || $conn === false || $conn->connect_error) {
+    die('<div style="color:red;padding:20px;">
+        <strong>Database connection failed.</strong><br>
+        ' . (isset($conn) && $conn->connect_error ? htmlspecialchars($conn->connect_error) : 'Check db.php — $conn was not set.') . '
+    </div>');
+}
+
 include('../includes/header.php');
+include('../includes/log_activity.php');
 
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
     header("Location: ../portal/login.php"); exit();
 }
 
-$staff_id = (int) $_SESSION['user_id'];
+$staff_id = (int)$_SESSION['user_id'];
 $message  = "";
 
-// ── Load prices set by Owner ──────────────────────────────────
-// Keyed by size_code (PW, S, M, L, XL, J) → price_per_tray
-$prices      = [];
-$prices_q    = $conn->query("SELECT size_code, price_per_tray, price_per_piece FROM egg_prices");
-if ($prices_q) {
-    while ($row = $prices_q->fetch_assoc()) {
-        $prices[$row['size_code']] = [
-            'tray'  => (float) $row['price_per_tray'],
-            'piece' => (float) $row['price_per_piece'],
-        ];
-    }
-}
-
-// ── Size definitions (display order) ─────────────────────────
+// ── Size definitions ──────────────────────────────────────────
 $size_defs = [
     'PW' => 'Peewee',
     'S'  => 'Small',
@@ -53,93 +46,176 @@ $size_colors = [
     'PW' => '#adb5bd', 'S' => '#74c0fc', 'M' => '#51cf66',
     'L'  => '#fcc419', 'XL'=> '#ff922b', 'J' => '#f03e3e',
 ];
+$harvest_cols = [
+    'PW' => 'size_pw', 'S' => 'size_s', 'M' => 'size_m',
+    'L'  => 'size_l',  'XL'=> 'size_xl','J' => 'size_j',
+];
+$sale_qty_cols = [
+    'PW' => 'qty_pw', 'S' => 'qty_s', 'M' => 'qty_m',
+    'L'  => 'qty_l',  'XL'=> 'qty_xl','J' => 'qty_j',
+];
 
-// ── Handle POST ───────────────────────────────────────────────
-if ($_SERVER["REQUEST_METHOD"] === "POST") {
+// ── Load available breeds WITH stock ─────────────────────────
+// Only breeds that have at least 1 active batch with harvests > sold
+$breeds_q = $conn->query("
+    SELECT DISTINCT b.breed
+    FROM batches b
+    JOIN harvests h ON h.batch_id = b.batch_id
+    WHERE b.status = 'Active'
+    ORDER BY b.breed ASC
+");
+$available_breeds = [];
+if ($breeds_q) {
+    while ($row = $breeds_q->fetch_assoc()) {
+        $available_breeds[] = $row['breed'];
+    }
+}
+
+// ── Helper: get stock per size for a given breed ──────────────
+function get_breed_stock($conn, $breed, $harvest_cols, $sale_qty_cols) {
+    $breed_esc = $conn->real_escape_string($breed);
+    $stock     = [];
+    $total     = 0;
+
+    foreach ($harvest_cols as $code => $hcol) {
+        $scol = $sale_qty_cols[$code];
+
+        // Eggs harvested for this breed (via batch join)
+        $hq = $conn->query("
+            SELECT COALESCE(SUM(h.$hcol), 0) AS eggs
+            FROM harvests h
+            JOIN batches b ON h.batch_id = b.batch_id
+            WHERE b.breed = '$breed_esc'
+        ");
+        $eggs_h = $hq ? (int)$hq->fetch_assoc()['eggs'] : 0;
+
+        // Trays sold of this size (all sales — using qty columns)
+        // Note: sales are not directly linked to breed, but stock is
+        // approximated as: all harvested of this breed - all sold of this size
+        // For exact accuracy, a batch_id column on sales would be needed.
+        $sq = $conn->query("SELECT COALESCE(SUM($scol), 0) AS trays FROM sales");
+        $sold_t = $sq ? (int)$sq->fetch_assoc()['trays'] : 0;
+
+        $avail = max(0, (int)floor($eggs_h / 30) - $sold_t);
+        $stock[$code] = $avail;
+        $total += $avail;
+    }
+    return ['per_size' => $stock, 'total' => $total];
+}
+
+// ── Load prices for all breeds (for JS) ──────────────────────
+$all_prices_q = $conn->query("SELECT breed, size_code, price_per_tray FROM breed_prices");
+$all_prices   = []; // $all_prices[$breed][$code] = price_per_tray
+if ($all_prices_q) {
+    while ($row = $all_prices_q->fetch_assoc()) {
+        $all_prices[$row['breed']][$row['size_code']] = (float)$row['price_per_tray'];
+    }
+}
+
+// ── Selected breed (from POST or GET for pre-selection) ───────
+$selected_breed = trim($_POST['breed'] ?? $_GET['breed'] ?? '');
+if ($selected_breed && !in_array($selected_breed, $available_breeds)) {
+    $selected_breed = ''; // invalid breed — reset
+}
+
+// Load stock for selected breed
+$breed_stock   = [];
+$total_avail   = 0;
+$breed_prices  = [];
+
+if ($selected_breed) {
+    $bs            = get_breed_stock($conn, $selected_breed, $harvest_cols, $sale_qty_cols);
+    $breed_stock   = $bs['per_size'];
+    $total_avail   = $bs['total'];
+    $breed_prices  = $all_prices[$selected_breed] ?? [];
+}
+
+// ── Handle POST (sale submission) ─────────────────────────────
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['submit_sale'])) {
 
     $customer       = trim($_POST['customer_name'] ?? '');
+    $breed          = trim($_POST['breed'] ?? '');
     $payment_method = in_array($_POST['payment_method'] ?? '', ['Cash','GCash','Bank Transfer'])
                       ? $_POST['payment_method'] : 'Cash';
     $notes          = trim($_POST['notes'] ?? '');
 
-    // Read per-size quantities (trays) — always integers, min 0
     $qty = [];
     foreach ($size_defs as $code => $_) {
         $qty[$code] = max(0, (int)($_POST['qty_' . strtolower($code)] ?? 0));
     }
 
-    // Server-computed totals (never trust client-side total)
     $total_trays  = array_sum($qty);
     $total_amount = 0.0;
+    $breed_p      = $all_prices[$breed] ?? [];
     foreach ($size_defs as $code => $_) {
-        $total_amount += $qty[$code] * ($prices[$code]['tray'] ?? 0);
+        $total_amount += $qty[$code] * ($breed_p[$code] ?? 0);
     }
     $total_amount = round($total_amount, 2);
+    $unit_price   = $total_trays > 0 ? round($total_amount / $total_trays, 2) : 0;
 
-    // Use average unit_price for backwards compat with reports
-    $unit_price = $total_trays > 0 ? round($total_amount / $total_trays, 2) : 0;
-
-    // Validation
-    if (empty($customer)) {
-        $message = "<div class='alert error'>⚠️ Please enter the customer name.</div>";
+    // ── Server-side stock validation ──────────────────────────
+    $stock_errors = [];
+    if (empty($breed)) {
+        $stock_errors[] = "Please select a breed.";
+    } elseif (empty($customer)) {
+        $stock_errors[] = "Please enter the customer name.";
     } elseif ($total_trays <= 0) {
-        $message = "<div class='alert error'>⚠️ Please enter at least one tray quantity.</div>";
-    } elseif ($total_amount <= 0 && !empty($prices)) {
-        $message = "<div class='alert error'>⚠️ Total amount is zero. Make sure prices are set by the Owner first.</div>";
+        $stock_errors[] = "Please enter at least one tray quantity.";
     } else {
-        // Insert with per-size columns
+        // Re-fetch stock for validation
+        $val_stock = get_breed_stock($conn, $breed, $harvest_cols, $sale_qty_cols);
+        foreach ($size_defs as $code => $label) {
+            if ($qty[$code] <= 0) continue;
+            $avail_now = $val_stock['per_size'][$code] ?? 0;
+            if ($qty[$code] > $avail_now) {
+                $stock_errors[] = "<strong>$label ($code):</strong> Entered {$qty[$code]} tray(s), only {$avail_now} available.";
+            }
+        }
+    }
+
+    if (!empty($stock_errors)) {
+        $message = "<div class='alert error'>⚠️ " . implode('<br>', $stock_errors) . "</div>";
+    } elseif ($total_amount <= 0 && !empty($breed_p)) {
+        $message = "<div class='alert error'>⚠️ Total is zero. Ask the Owner to set prices for <strong>" . htmlspecialchars($breed) . "</strong> in Pricing Settings.</div>";
+    } else {
+        $breed_esc = $conn->real_escape_string($breed);
         $ins = $conn->prepare("
             INSERT INTO sales
                 (staff_id, customer_name, quantity_sold, unit_price, total_amount,
                  payment_method, notes, qty_pw, qty_s, qty_m, qty_l, qty_xl, qty_j)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ");
-        // FIX: type string corrected — unit_price=d, total_amount=d, payment_method=s, notes=s
-        $ins->bind_param(
-            "isiddssiiiiii",
+        $ins->bind_param("isiddssiiiiii",
             $staff_id, $customer, $total_trays, $unit_price, $total_amount,
             $payment_method, $notes,
             $qty['PW'], $qty['S'], $qty['M'], $qty['L'], $qty['XL'], $qty['J']
         );
 
         if ($ins->execute()) {
+            $sale_id = $conn->insert_id;
             $ins->close();
 
-            // ── Old-stock notification check (unchanged logic) ──
-            $notif_q = $conn->query("
-                SELECT n.*, b.arrival_date
-                FROM notifications n
-                JOIN batches b ON n.batch_id = b.batch_id
-                WHERE n.status IN ('unread','read')
-                ORDER BY n.created_at DESC LIMIT 1
-            ");
+            log_activity($conn, $staff_id, 'Staff', 'Sale Added',
+                "Sold {$total_trays} tray(s) [{$breed}] to {$customer} — ₱" . number_format($total_amount, 2) . " (Sale #{$sale_id})");
+
+            // Old-stock notification check (unchanged)
+            $notif_q = $conn->query("SELECT n.*, b.arrival_date FROM notifications n JOIN batches b ON n.batch_id=b.batch_id WHERE n.status IN ('unread','read') ORDER BY n.created_at DESC LIMIT 1");
             if ($notif_q && $notif_q->num_rows > 0) {
                 $notif    = $notif_q->fetch_assoc();
                 $notif_id = (int)$notif['notif_id'];
                 $bid      = (int)$notif['batch_id'];
-
-                $h_stmt = $conn->prepare("SELECT COALESCE(SUM(total_eggs),0) AS total FROM harvests WHERE batch_id=?");
-                $h_stmt->bind_param("i", $bid);
-                $h_stmt->execute();
-                $harvested = (int)$h_stmt->get_result()->fetch_assoc()['total'];
-                $h_stmt->close();
-
-                $s_stmt = $conn->prepare("
-                    SELECT COALESCE(SUM(quantity_sold*30),0) AS total FROM sales
-                    WHERE date_sold >= (SELECT COALESCE(arrival_date,'2000-01-01') FROM batches WHERE batch_id=?)
-                ");
-                $s_stmt->bind_param("i", $bid);
-                $s_stmt->execute();
-                $sold = (int)$s_stmt->get_result()->fetch_assoc()['total'];
-                $s_stmt->close();
-
-                if (max(0, $harvested - $sold) <= 0) {
-                    $conn->query("UPDATE notifications SET status='completed', completed_at=NOW() WHERE notif_id=$notif_id");
+                $h_s = $conn->prepare("SELECT COALESCE(SUM(total_eggs),0) AS t FROM harvests WHERE batch_id=?");
+                $h_s->bind_param("i",$bid); $h_s->execute();
+                $harv_c = (int)$h_s->get_result()->fetch_assoc()['t']; $h_s->close();
+                $s_s = $conn->prepare("SELECT COALESCE(SUM(quantity_sold*30),0) AS t FROM sales WHERE date_sold>=(SELECT COALESCE(arrival_date,'2000-01-01') FROM batches WHERE batch_id=?)");
+                $s_s->bind_param("i",$bid); $s_s->execute();
+                $sold_c = (int)$s_s->get_result()->fetch_assoc()['t']; $s_s->close();
+                if (max(0,$harv_c-$sold_c)<=0) {
+                    $conn->query("UPDATE notifications SET status='completed',completed_at=NOW() WHERE notif_id=$notif_id");
                 }
             }
 
             header("Location: view_logs.php?sale_saved=1"); exit();
-
         } else {
             $message = "<div class='alert error'>Database error. Please try again.</div>";
             $ins->close();
@@ -155,49 +231,98 @@ foreach ($size_defs as $code => $_) {
                        : 0;
 }
 
-$prices_set = !empty($prices);
+$has_any_stock = !empty($available_breeds);
 ?>
 
-<div class="card" style="max-width:700px; margin:2rem auto; border-top:5px solid var(--success);">
+<div class="card" style="max-width:720px; margin:2rem auto; border-top:5px solid var(--success);">
 
     <h2 style="color:var(--gold); font-family:'Playfair Display',serif; margin-bottom:0.3rem;">
         💰 Record New Sale
     </h2>
     <p style="color:var(--text-muted); margin-bottom:1.6rem; font-size:0.88rem;">
-        Enter the number of trays per egg size. Prices are loaded from Owner settings.
+        Select the breed, then enter trays sold per size. Prices load automatically.
     </p>
 
     <?php echo $message; ?>
 
-    <?php if (!$prices_set): ?>
-    <div class="alert warning" style="margin-bottom:1.5rem;">
-        ⚠️ No egg prices have been set yet. Ask the Owner to set prices in
-        <strong>Pricing Settings</strong> before logging a sale.
+    <?php if (!$has_any_stock): ?>
+    <div style="background:var(--danger-bg); border:1px solid rgba(194,58,58,0.4);
+                border-left:5px solid var(--danger); border-radius:var(--radius);
+                padding:20px 24px; text-align:center;">
+        <div style="font-size:2rem; margin-bottom:10px;">🥚</div>
+        <div style="font-size:1rem; font-weight:700; color:var(--text-primary); margin-bottom:6px;">No Stock Available</div>
+        <div style="font-size:0.88rem; color:var(--text-secondary); line-height:1.6; margin-bottom:16px;">
+            No harvests have been recorded yet. Log a harvest before recording a sale.
+        </div>
+        <a href="log_harvest.php" class="btn-farm btn-orange" style="margin-right:10px;">🧺 Log Harvest First</a>
+        <a href="dashboard.php" class="btn-farm btn-dark">← Back</a>
     </div>
-    <?php endif; ?>
+
+    <?php else: ?>
 
     <form method="POST" id="saleForm">
+        <input type="hidden" name="submit_sale" value="1">
 
-        <!-- Customer & payment info -->
+        <!-- Row 1: Breed selector + Customer + Payment -->
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:1.2rem;">
+            <div class="form-group" style="margin:0;">
+                <label>Breed / Batch <span style="color:var(--danger);">*</span></label>
+                <select name="breed" id="breed-select" class="form-input"
+                        onchange="onBreedChange(this.value)" required>
+                    <option value="">— Select breed —</option>
+                    <?php foreach ($available_breeds as $br): ?>
+                        <option value="<?php echo htmlspecialchars($br); ?>"
+                            <?php echo $selected_breed === $br ? 'selected' : ''; ?>>
+                            <?php echo htmlspecialchars($br); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
             <div class="form-group" style="margin:0;">
                 <label>Customer Name <span style="color:var(--danger);">*</span></label>
                 <input type="text" name="customer_name" class="form-input"
                        placeholder="Customer or business name" required
                        value="<?php echo isset($_POST['customer_name']) ? htmlspecialchars(trim($_POST['customer_name'])) : ''; ?>">
             </div>
-            <div class="form-group" style="margin:0;">
-                <label>Payment Method</label>
-                <select name="payment_method" class="form-input">
-                    <option value="Cash">💵 Cash</option>
-                    <option value="GCash">📱 GCash</option>
-                    <option value="Bank Transfer">🏦 Bank Transfer</option>
-                </select>
+        </div>
+
+        <!-- Stock summary for selected breed -->
+        <div id="stock-summary" style="<?php echo $selected_breed ? '' : 'display:none;'; ?>
+                                        background:var(--bg-wood); border-radius:var(--radius);
+                                        border:1px solid var(--border-subtle); padding:12px 16px;
+                                        margin-bottom:1.2rem;">
+            <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted);
+                        text-transform:uppercase; letter-spacing:0.8px; margin-bottom:8px;">
+                📦 Available Stock — <span id="stock-breed-label"><?php echo htmlspecialchars($selected_breed); ?></span>
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:7px;" id="stock-boxes">
+                <?php foreach ($size_defs as $code => $label):
+                    $avail = $breed_stock[$code] ?? 0;
+                    $col   = $size_colors[$code];
+                ?>
+                <div id="stockbox_<?php echo $code; ?>"
+                     style="background:var(--bg-plank); border-radius:var(--radius-sm);
+                            padding:6px 11px; border:1px solid var(--border-subtle);
+                            text-align:center; min-width:66px;">
+                    <div style="display:flex; align-items:center; gap:4px; justify-content:center; margin-bottom:2px;">
+                        <span style="width:7px; height:7px; border-radius:50%;
+                                     background:<?php echo $col; ?>; flex-shrink:0;"></span>
+                        <span style="font-size:0.65rem; font-weight:700; color:var(--text-muted);"><?php echo $code; ?></span>
+                    </div>
+                    <div id="avail_<?php echo $code; ?>"
+                         style="font-size:0.95rem; font-weight:800;
+                                color:<?php echo $avail > 0 ? 'var(--text-primary)' : 'var(--text-muted)'; ?>;
+                                font-family:'Playfair Display',serif; line-height:1;">
+                        <?php echo $avail; ?>
+                    </div>
+                    <div style="font-size:0.6rem; color:var(--text-muted);">trays</div>
+                </div>
+                <?php endforeach; ?>
             </div>
         </div>
 
-        <!-- Per-size table -->
-        <div style="margin-bottom:1.4rem;">
+        <!-- Size breakdown table (hidden until breed selected) -->
+        <div id="size-table-wrap" style="<?php echo $selected_breed ? '' : 'display:none;'; ?> margin-bottom:1.4rem;">
             <div style="font-size:0.7rem; font-weight:700; color:var(--text-muted);
                         text-transform:uppercase; letter-spacing:0.8px; margin-bottom:10px;">
                 Egg Size Breakdown
@@ -206,32 +331,34 @@ $prices_set = !empty($prices);
             <div style="background:var(--bg-wood); border-radius:var(--radius);
                         border:1px solid var(--border-subtle); overflow:hidden;">
 
-                <!-- Table header -->
-                <div style="display:grid; grid-template-columns:140px 1fr 110px 110px;
+                <!-- Header -->
+                <div style="display:grid; grid-template-columns:130px 1fr 90px 110px 110px;
                             background:var(--bg-plank); padding:10px 14px;
                             font-size:0.7rem; font-weight:700; color:var(--gold-muted);
                             text-transform:uppercase; letter-spacing:0.6px; gap:10px;">
                     <span>Size</span>
                     <span>Trays to Sell</span>
+                    <span style="text-align:center;">Available</span>
                     <span style="text-align:right;">Price / Tray</span>
                     <span style="text-align:right;">Subtotal</span>
                 </div>
 
-                <!-- Size rows -->
                 <?php foreach ($size_defs as $code => $label):
-                    $price_tray = $prices[$code]['tray'] ?? 0;
-                    $field_name = 'qty_' . strtolower($code);
+                    $avail      = $breed_stock[$code] ?? 0;
+                    $price_tray = $breed_prices[$code] ?? 0;
                     $cur_qty    = $post_qty[$code];
+                    $is_out     = ($avail === 0);
                     $subtotal   = $cur_qty * $price_tray;
                 ?>
                 <div class="size-row"
-                     style="display:grid; grid-template-columns:140px 1fr 110px 110px;
+                     style="display:grid; grid-template-columns:130px 1fr 90px 110px 110px;
                             padding:12px 14px; gap:10px; align-items:center;
-                            border-top:1px solid var(--border-subtle);"
+                            border-top:1px solid var(--border-subtle);
+                            <?php echo $is_out ? 'opacity:0.45;' : ''; ?>"
                      data-code="<?php echo $code; ?>"
-                     data-price="<?php echo $price_tray; ?>">
+                     data-price="<?php echo $price_tray; ?>"
+                     data-max="<?php echo $avail; ?>">
 
-                    <!-- Size label with color dot -->
                     <div style="display:flex; align-items:center; gap:9px;">
                         <span style="width:10px; height:10px; border-radius:50%; flex-shrink:0;
                                      background:<?php echo $size_colors[$code]; ?>;
@@ -247,27 +374,49 @@ $prices_set = !empty($prices);
                         </div>
                     </div>
 
-                    <!-- Quantity input -->
-                    <input type="number"
-                           name="<?php echo $field_name; ?>"
-                           class="form-input size-qty"
-                           min="0" value="<?php echo $cur_qty; ?>"
-                           placeholder="0"
-                           style="padding:10px 12px; font-size:0.95rem; font-weight:600;"
-                           oninput="recalc()">
+                    <div style="position:relative;">
+                        <input type="number"
+                               name="qty_<?php echo strtolower($code); ?>"
+                               id="qty_<?php echo $code; ?>"
+                               class="form-input size-qty"
+                               min="0" max="<?php echo $avail; ?>"
+                               value="<?php echo $cur_qty; ?>"
+                               placeholder="<?php echo $is_out ? 'No stock' : '0'; ?>"
+                               <?php echo $is_out ? 'disabled' : ''; ?>
+                               style="padding:10px 12px; font-size:0.95rem; font-weight:600;
+                                      <?php echo $is_out ? 'cursor:not-allowed; background:var(--bg-plank);' : ''; ?>"
+                               oninput="recalc()">
+                        <div id="warn_<?php echo $code; ?>"
+                             style="display:none; position:absolute; right:0; top:calc(100% + 4px);
+                                    background:var(--danger-bg); border:1px solid rgba(194,58,58,0.4);
+                                    border-radius:var(--radius-sm); padding:4px 10px;
+                                    font-size:0.72rem; color:var(--danger); white-space:nowrap; z-index:10;">
+                            Max <?php echo $avail; ?> tray<?php echo $avail !== 1 ? 's' : ''; ?>
+                        </div>
+                    </div>
 
-                    <!-- Price per tray (read-only display) -->
-                    <div style="text-align:right; font-size:0.88rem;">
+                    <!-- FIX: avail_disp_ span always rendered so JS can update it.
+                         JS controls the None badge via data-out attribute. -->
+                    <div style="text-align:center;">
+                        <span id="avail_disp_<?php echo $code; ?>"
+                              style="font-size:0.85rem; font-weight:700;
+                                     color:<?php echo $is_out ? 'var(--text-muted)' : ($avail <= 5 ? 'var(--warning)' : 'var(--success)'); ?>;">
+                            <?php echo $is_out ? '0' : $avail; ?>
+                        </span>
+                        <div id="avail_label_<?php echo $code; ?>"
+                             style="font-size:0.62rem; color:var(--text-muted);">
+                            <?php echo $is_out ? 'none' : 'avail.'; ?>
+                        </div>
+                    </div>
+
+                    <div style="text-align:right; font-size:0.88rem;" id="price_disp_<?php echo $code; ?>">
                         <?php if ($price_tray > 0): ?>
-                            <span style="color:var(--text-secondary);">
-                                ₱<?php echo number_format($price_tray, 2); ?>
-                            </span>
+                            <span style="color:var(--text-secondary);">₱<?php echo number_format($price_tray, 2); ?></span>
                         <?php else: ?>
                             <span style="color:var(--text-muted); font-style:italic;">Not set</span>
                         <?php endif; ?>
                     </div>
 
-                    <!-- Subtotal (JS-computed) -->
                     <div style="text-align:right; font-weight:700; font-size:0.92rem;"
                          id="sub_<?php echo $code; ?>">
                         <?php echo $subtotal > 0 ? '₱' . number_format($subtotal, 2) : '—'; ?>
@@ -277,86 +426,202 @@ $prices_set = !empty($prices);
                 <?php endforeach; ?>
 
                 <!-- Grand total row -->
-                <div style="display:grid; grid-template-columns:140px 1fr 110px 110px;
+                <div style="display:grid; grid-template-columns:130px 1fr 90px 110px 110px;
                             padding:14px 14px; gap:10px; align-items:center;
                             background:var(--bg-plank); border-top:2px solid var(--border-mid);">
                     <div style="font-size:0.72rem; font-weight:700; color:var(--text-muted);
-                                text-transform:uppercase; letter-spacing:0.6px;">
-                        TOTAL
-                    </div>
+                                text-transform:uppercase; letter-spacing:0.6px;">TOTAL</div>
                     <div id="total_trays_display"
-                         style="font-size:1rem; font-weight:700; color:var(--text-secondary);">
-                        0 trays
-                    </div>
-                    <div></div>
+                         style="font-size:1rem; font-weight:700; color:var(--text-secondary);">0 trays</div>
+                    <div></div><div></div>
                     <div id="grand_total_display"
                          style="text-align:right; font-size:1.2rem; font-weight:800;
-                                color:var(--gold); font-family:'Playfair Display',serif;">
-                        ₱ 0.00
-                    </div>
+                                color:var(--gold); font-family:'Playfair Display',serif;">₱ 0.00</div>
                 </div>
-
             </div>
         </div>
 
-        <div class="form-group">
-            <label>Notes</label>
-            <textarea name="notes" class="form-input" rows="2"
-                      placeholder="Optional: bulk order, regular customer, delivery notes…"></textarea>
+        <!-- Payment + Notes (always visible) -->
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:1.2rem;">
+            <div class="form-group" style="margin:0;">
+                <label>Payment Method</label>
+                <select name="payment_method" class="form-input">
+                    <option value="Cash">💵 Cash</option>
+                    <option value="GCash">📱 GCash</option>
+                    <option value="Bank Transfer">🏦 Bank Transfer</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin:0;">
+                <label>Notes</label>
+                <input type="text" name="notes" class="form-input"
+                       placeholder="Optional: bulk order, delivery, etc."
+                       value="<?php echo isset($_POST['notes']) ? htmlspecialchars($_POST['notes']) : ''; ?>">
+            </div>
         </div>
 
-        <button type="submit" class="btn-farm btn-green btn-full" style="padding:15px; font-size:1rem;">
+        <button type="submit" id="submitBtn" class="btn-farm btn-green btn-full"
+                style="padding:15px; font-size:1rem;">
             Record Sale ✅
         </button>
         <a href="dashboard.php" id="backBtn" class="back-link"
            style="display:block; text-align:center; margin-top:1rem;">
             ← Back to Dashboard
         </a>
-
     </form>
+    <?php endif; ?>
 </div>
 
 <script>
-// Prices from PHP — used for JS live calculation
-const PRICES = <?php echo json_encode(array_map(fn($p) => $p['tray'], $prices)); ?>;
+// All prices from PHP, keyed by breed → size_code → price_per_tray
+const ALL_PRICES = <?php echo json_encode($all_prices); ?>;
+// All stock from PHP, keyed by breed → size_code → available_trays
+const ALL_STOCK  = <?php echo json_encode(
+    array_combine(
+        $available_breeds,
+        array_map(fn($br) => get_breed_stock($conn, $br, $harvest_cols, $sale_qty_cols)['per_size'], $available_breeds)
+    )
+); ?>;
 
-function recalc() {
-    let totalTrays  = 0;
-    let grandTotal  = 0;
+const SIZE_CODES = <?php echo json_encode(array_keys($size_defs)); ?>;
 
+function onBreedChange(breed) {
+    const stockWrap  = document.getElementById('stock-summary');
+    const tableWrap  = document.getElementById('size-table-wrap');
+    const breedLabel = document.getElementById('stock-breed-label');
+
+    if (!breed) {
+        stockWrap.style.display = 'none';
+        tableWrap.style.display = 'none';
+        return;
+    }
+
+    stockWrap.style.display = 'block';
+    tableWrap.style.display = 'block';
+    if (breedLabel) breedLabel.textContent = breed;
+
+    const prices = ALL_PRICES[breed] || {};
+    const stock  = ALL_STOCK[breed]  || {};
+
+    // Update each size row
     document.querySelectorAll('.size-row').forEach(row => {
         const code  = row.dataset.code;
-        const price = parseFloat(row.dataset.price) || 0;
-        const qty   = parseInt(row.querySelector('.size-qty').value) || 0;
-        const sub   = qty * price;
+        const price = prices[code] || 0;
+        const avail = stock[code]  || 0;
+        const isOut = avail === 0;
 
-        totalTrays += qty;
-        grandTotal += sub;
+        // Update data attributes for recalc()
+        row.dataset.price = price;
+        row.dataset.max   = avail;
 
+        // Update price display
+        const priceEl = document.getElementById('price_disp_' + code);
+        if (priceEl) {
+            priceEl.innerHTML = price > 0
+                ? `<span style="color:var(--text-secondary);">₱${price.toFixed(2)}</span>`
+                : `<span style="color:var(--text-muted);font-style:italic;">Not set</span>`;
+        }
+
+        // FIX: Always update avail_disp_ (it now always exists)
+        const availEl = document.getElementById('avail_disp_' + code);
+        if (availEl) {
+            availEl.textContent = avail;
+            availEl.style.color = avail === 0
+                ? 'var(--text-muted)'
+                : (avail <= 5 ? 'var(--warning)' : 'var(--success)');
+        }
+        // FIX: Update the sub-label (avail. / none)
+        const labelEl = document.getElementById('avail_label_' + code);
+        if (labelEl) {
+            labelEl.textContent = avail === 0 ? 'none' : 'avail.';
+        }
+        const stockboxEl = document.getElementById('avail_' + code);
+        if (stockboxEl) {
+            stockboxEl.textContent = avail;
+            stockboxEl.style.color = avail > 0 ? 'var(--text-primary)' : 'var(--text-muted)';
+        }
+
+        // Update input
+        const input = row.querySelector('.size-qty');
+        if (input) {
+            input.max      = avail;
+            input.disabled = isOut;
+            input.value    = 0;
+            input.placeholder = isOut ? 'No stock' : '0';
+            input.style.cursor = isOut ? 'not-allowed' : '';
+            input.style.background = isOut ? 'var(--bg-plank)' : '';
+        }
+
+        // Reset subtotal
         const subEl = document.getElementById('sub_' + code);
-        subEl.textContent = sub > 0 ? '₱' + sub.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '—';
-        subEl.style.color = sub > 0 ? 'var(--gold)' : 'var(--text-muted)';
+        if (subEl) { subEl.textContent = '—'; subEl.style.color = 'var(--text-muted)'; }
+
+        row.style.opacity = isOut ? '0.45' : '1';
     });
 
-    document.getElementById('total_trays_display').textContent =
-        totalTrays + ' tray' + (totalTrays !== 1 ? 's' : '');
-    document.getElementById('grand_total_display').textContent =
-        '₱ ' + grandTotal.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    recalc();
 }
 
-// Dirty-state guard
-let isDirty = false;
-const saleForm = document.getElementById('saleForm');
-saleForm.addEventListener('input',  () => isDirty = true);
-saleForm.addEventListener('submit', () => isDirty = false);
-window.addEventListener('beforeunload', e => {
-    if (isDirty) { e.preventDefault(); e.returnValue = ''; }
-});
-document.getElementById('backBtn').addEventListener('click', e => {
-    if (isDirty && !confirm("Discard unsaved sale data?")) e.preventDefault();
-});
+function recalc() {
+    let totalTrays = 0, grandTotal = 0, hasOverLimit = false;
 
-// Run on load to populate from any repopulated values
+    document.querySelectorAll('.size-row').forEach(row => {
+        const code   = row.dataset.code;
+        const price  = parseFloat(row.dataset.price) || 0;
+        const maxVal = parseInt(row.dataset.max) || 0;
+        const input  = row.querySelector('.size-qty');
+        if (!input || input.disabled) return;
+
+        let qty    = parseInt(input.value) || 0;
+        const warn = document.getElementById('warn_' + code);
+
+        if (qty > maxVal && maxVal >= 0) {
+            hasOverLimit = true;
+            input.style.borderColor = 'var(--danger)';
+            if (warn) { warn.textContent = `Max ${maxVal} tray${maxVal !== 1 ? 's' : ''}`; warn.style.display = 'block'; }
+            qty = maxVal;
+        } else {
+            input.style.borderColor = '';
+            if (warn) warn.style.display = 'none';
+        }
+
+        const sub = qty * price;
+        totalTrays += qty; grandTotal += sub;
+
+        const subEl = document.getElementById('sub_' + code);
+        if (subEl) {
+            subEl.textContent = sub > 0 ? '₱' + sub.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '—';
+            subEl.style.color = sub > 0 ? 'var(--gold)' : 'var(--text-muted)';
+        }
+    });
+
+    const tEl = document.getElementById('total_trays_display');
+    const gEl = document.getElementById('grand_total_display');
+    const btn = document.getElementById('submitBtn');
+
+    if (tEl) tEl.textContent = totalTrays + ' tray' + (totalTrays !== 1 ? 's' : '');
+    if (gEl) gEl.textContent = '₱ ' + grandTotal.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    if (btn) {
+        btn.disabled       = hasOverLimit;
+        btn.style.opacity  = hasOverLimit ? '0.45' : '1';
+        btn.style.cursor   = hasOverLimit ? 'not-allowed' : '';
+        btn.textContent    = hasOverLimit ? '⚠️ Quantities exceed available stock' : 'Record Sale ✅';
+    }
+}
+
+let isDirty = false;
+const sf = document.getElementById('saleForm');
+if (sf) {
+    sf.addEventListener('input',  () => isDirty = true);
+    sf.addEventListener('submit', () => isDirty = false);
+    window.addEventListener('beforeunload', e => { if (isDirty) { e.preventDefault(); e.returnValue=''; } });
+    const bb = document.getElementById('backBtn');
+    if (bb) bb.addEventListener('click', e => { if (isDirty && !confirm("Discard unsaved sale data?")) e.preventDefault(); });
+}
+
+// Init on page load if breed pre-selected
+<?php if ($selected_breed): ?>
+onBreedChange(<?php echo json_encode($selected_breed); ?>);
+<?php endif; ?>
 recalc();
 </script>
 

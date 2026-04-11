@@ -16,6 +16,7 @@ $page_title = 'Login';
 
 include('../includes/db.php');
 include('../includes/header.php');
+include('../includes/log_activity.php');
 
 // Redirect if already logged in
 if (isset($_SESSION['role'])) {

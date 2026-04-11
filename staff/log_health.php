@@ -4,6 +4,7 @@ $page_title = 'Flock Health Report';
 
 include('../includes/db.php');
 include('../includes/header.php');
+include('../includes/log_activity.php');
 
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
     header("Location: ../portal/login.php"); exit();
@@ -11,7 +12,6 @@ if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Staff') {
 
 $message = "";
 
-// FIX: Prepared statement for batch fetch
 $batch_stmt = $conn->prepare("SELECT batch_id, breed FROM batches WHERE status='Active' ORDER BY batch_id ASC");
 $batch_stmt->execute();
 $batch_query = $batch_stmt->get_result();
@@ -23,11 +23,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $mortality_count = max(0, (int) ($_POST['mortality_count'] ?? 0));
     $symptoms        = trim($_POST['symptoms'] ?? '');
 
-    // Whitelist status_level
     $allowed_levels = ['Healthy', 'Warning', 'Critical'];
     $status_level   = in_array($_POST['status_level'] ?? '', $allowed_levels) ? $_POST['status_level'] : 'Healthy';
 
-    // FIX: Validate batch with prepared statement
     $check = $conn->prepare("SELECT batch_id FROM batches WHERE batch_id=? AND status='Active' LIMIT 1");
     $check->bind_param("i", $batch_id);
     $check->execute();
@@ -38,11 +36,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     if (!$valid_batch) {
         $message = "<div class='alert error'>⚠️ Please select a valid active batch.</div>";
     } else {
-        // FIX: Full prepared statement insert
         $ins = $conn->prepare("INSERT INTO flock_health (staff_id, batch_id, status_level, mortality_count, symptoms) VALUES (?,?,?,?,?)");
         $ins->bind_param("iisis", $staff_id, $batch_id, $status_level, $mortality_count, $symptoms);
         if ($ins->execute()) {
+            $report_id = $conn->insert_id;
             $ins->close();
+            // Log activity
+            log_activity($conn, $staff_id, 'Staff', 'Health Added',
+                "Batch #{$batch_id} — Status: {$status_level}, Mortality: {$mortality_count} (Report #{$report_id})");
             header("Location: view_logs.php?health_saved=1"); exit();
         } else {
             $message = "<div class='alert error'>Database error. Please try again.</div>";

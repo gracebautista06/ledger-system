@@ -2,120 +2,100 @@
 /* ============================================================
    owner/dashboard.php — Owner/Admin Command Center
 
-   IMPROVEMENTS v2:
-   - Added Revenue vs Harvest dual-chart (line + bar combo)
-   - Added "Top Customers This Month" widget from sales data
-   - Added "Flock Health Summary" — shows any active Critical/Warning batches
-   - Added "Next Batch Replacement" pulled dynamically from DB
-   - Monthly revenue trend (last 6 months) added as second chart
-   - All hardcoded colors replaced with new dark theme CSS vars
-   - Stat cards now show change vs. yesterday (harvest) and last month (revenue)
+   FOLDER STRUCTURE THIS DASHBOARD ASSUMES:
+   owner/
+   ├── dashboard.php                      ← THIS FILE
+   ├── manage_inventory/
+   │   ├── inventory.php                  🟢 Active stock
+   │   └── inventory_history.php          🟡 Archive
+   ├── manage_flocks/
+   │   ├── batches.php                    📦 Flock management
+   │   ├── prices.php                     📦 Egg pricing
+   │   └── flock_history.php              🟡 Archive
+   ├── manage_sales/
+   │   ├── view_sales.php                 🟢 Today's sales
+   │   ├── sales_history.php              🟡 Full history + export
+   │   ├── export_sales.php               🔧 Export helper
+   │   └── export_history.php             🔧 Export helper
+   └── manage_users/
+       ├── users.php                      📦 Staff management
+       └── user_activity_log.php          🟡 Audit trail
    ============================================================ */
 
 $page_title = 'Owner Dashboard';
 
 session_start();
 include('../includes/db.php');
-include('../staff/sell_first_alert.php');
 include('../includes/header.php');
+include('../includes/notifications.php');
 
 if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Owner') {
-    header("Location: ../portal/login.php");
-    exit();
+    header("Location: ../portal/login.php"); exit();
 }
 
-// --- STAT: Pending edit requests ---
-$req_query     = $conn->query("SELECT COUNT(*) AS total FROM edit_requests WHERE status = 'Pending'");
-$pending_count = (int) $req_query->fetch_assoc()['total'];
+// ── STATS ─────────────────────────────────────────────────────
+$req_query     = $conn->query("SELECT COUNT(*) AS total FROM edit_requests WHERE status='Pending'");
+$pending_count = (int)$req_query->fetch_assoc()['total'];
 
-// --- STAT: Today's harvest ---
-$today_query = $conn->query("SELECT COALESCE(SUM(total_eggs), 0) AS today_eggs FROM harvests WHERE DATE(date_logged) = CURDATE()");
-$today_eggs  = (int) $today_query->fetch_assoc()['today_eggs'];
+$today_query  = $conn->query("SELECT COALESCE(SUM(total_eggs),0) AS today_eggs FROM harvests WHERE DATE(date_logged)=CURDATE()");
+$today_eggs   = (int)$today_query->fetch_assoc()['today_eggs'];
 
-// --- STAT: Yesterday's harvest (for comparison arrow) ---
-$yest_query  = $conn->query("SELECT COALESCE(SUM(total_eggs), 0) AS yest FROM harvests WHERE DATE(date_logged) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)");
-$yest_eggs   = (int) $yest_query->fetch_assoc()['yest'];
+$yest_query   = $conn->query("SELECT COALESCE(SUM(total_eggs),0) AS yest FROM harvests WHERE DATE(date_logged)=DATE_SUB(CURDATE(),INTERVAL 1 DAY)");
+$yest_eggs    = (int)$yest_query->fetch_assoc()['yest'];
 $harvest_diff = $today_eggs - $yest_eggs;
 
-// --- STAT: Total staff count ---
-$staff_query = $conn->query("SELECT COUNT(*) AS total FROM users WHERE role = 'Staff'");
-$staff_count = (int) $staff_query->fetch_assoc()['total'];
+$staff_query  = $conn->query("SELECT COUNT(*) AS total FROM users WHERE role='Staff'");
+$staff_count  = (int)$staff_query->fetch_assoc()['total'];
 
-// --- STAT: This month's revenue ---
-$rev_query   = $conn->query("SELECT COALESCE(SUM(total_amount), 0) AS month_rev FROM sales WHERE MONTH(date_sold)=MONTH(NOW()) AND YEAR(date_sold)=YEAR(NOW())");
-$month_rev   = (float) $rev_query->fetch_assoc()['month_rev'];
+$rev_query    = $conn->query("SELECT COALESCE(SUM(total_amount),0) AS month_rev FROM sales WHERE MONTH(date_sold)=MONTH(NOW()) AND YEAR(date_sold)=YEAR(NOW())");
+$month_rev    = (float)$rev_query->fetch_assoc()['month_rev'];
 
-// --- STAT: Last month's revenue (for comparison) ---
-$prev_rev_q  = $conn->query("SELECT COALESCE(SUM(total_amount), 0) AS prev_rev FROM sales WHERE MONTH(date_sold)=MONTH(DATE_SUB(NOW(),INTERVAL 1 MONTH)) AND YEAR(date_sold)=YEAR(DATE_SUB(NOW(),INTERVAL 1 MONTH))");
-$prev_rev    = (float) $prev_rev_q->fetch_assoc()['prev_rev'];
-$rev_pct     = $prev_rev > 0 ? round((($month_rev - $prev_rev) / $prev_rev) * 100, 1) : null;
+$prev_rev_q   = $conn->query("SELECT COALESCE(SUM(total_amount),0) AS prev_rev FROM sales WHERE MONTH(date_sold)=MONTH(DATE_SUB(NOW(),INTERVAL 1 MONTH)) AND YEAR(date_sold)=YEAR(DATE_SUB(NOW(),INTERVAL 1 MONTH))");
+$prev_rev     = (float)$prev_rev_q->fetch_assoc()['prev_rev'];
+$rev_pct      = $prev_rev > 0 ? round((($month_rev - $prev_rev) / $prev_rev) * 100, 1) : null;
 
-
-// --- STAT: Active sell-first notification (old stock) ---
-$sell_notif_q   = $conn->query("SELECT n.*, b.breed FROM notifications n JOIN batches b ON n.batch_id=b.batch_id WHERE n.status IN ('unread','read') ORDER BY n.created_at DESC LIMIT 1");
-$sell_notif     = ($sell_notif_q && $sell_notif_q->num_rows > 0) ? $sell_notif_q->fetch_assoc() : null;
-
-// --- STAT: Completed (old stock fully sold) notifications since yesterday ---
-$completed_notif_q = $conn->query("SELECT n.*, b.breed FROM notifications n JOIN batches b ON n.batch_id=b.batch_id WHERE n.status='completed' AND n.completed_at >= DATE_SUB(NOW(), INTERVAL 1 DAY) ORDER BY n.completed_at DESC LIMIT 1");
-$completed_notif   = ($completed_notif_q && $completed_notif_q->num_rows > 0) ? $completed_notif_q->fetch_assoc() : null;
-
-// --- CHART 1: Last 7 days harvest ---
-$chart_labels = [];
-$chart_data   = [];
+// ── CHARTS ────────────────────────────────────────────────────
+$chart_labels = []; $chart_data = [];
 for ($i = 6; $i >= 0; $i--) {
     $d = date('Y-m-d', strtotime("-$i days"));
     $q = $conn->query("SELECT COALESCE(SUM(total_eggs),0) AS total FROM harvests WHERE DATE(date_logged)='$d'");
     $chart_labels[] = date('D', strtotime($d));
-    $chart_data[]   = (int) $q->fetch_assoc()['total'];
+    $chart_data[]   = (int)$q->fetch_assoc()['total'];
 }
 
-// --- CHART 2: Last 6 months revenue ---
-$rev_labels = [];
-$rev_data   = [];
+$rev_labels = []; $rev_data = [];
 for ($i = 5; $i >= 0; $i--) {
     $m_start = date('Y-m-01', strtotime("-$i months"));
     $m_end   = date('Y-m-t',  strtotime("-$i months"));
     $rev_q   = $conn->query("SELECT COALESCE(SUM(total_amount),0) AS rev FROM sales WHERE DATE(date_sold) BETWEEN '$m_start' AND '$m_end'");
     $rev_labels[] = date('M', strtotime($m_start));
-    $rev_data[]   = round((float) $rev_q->fetch_assoc()['rev'], 2);
+    $rev_data[]   = round((float)$rev_q->fetch_assoc()['rev'], 2);
 }
 
-// --- TOP CUSTOMERS this month ---
+// ── TOP CUSTOMERS ─────────────────────────────────────────────
 $top_cust = $conn->query("
-    SELECT customer_name,
-           COUNT(*) AS txn_count,
-           SUM(total_amount) AS total_spent,
-           SUM(quantity_sold) AS trays
+    SELECT customer_name, COUNT(*) AS txn_count,
+           SUM(total_amount) AS total_spent, SUM(quantity_sold) AS trays
     FROM sales
     WHERE MONTH(date_sold)=MONTH(NOW()) AND YEAR(date_sold)=YEAR(NOW())
-    GROUP BY customer_name
-    ORDER BY total_spent DESC
-    LIMIT 5
+    GROUP BY customer_name ORDER BY total_spent DESC LIMIT 5
 ");
 
-// --- FLOCK HEALTH SUMMARY (latest report per batch) ---
+// ── FLOCK HEALTH ──────────────────────────────────────────────
 $health_q = $conn->query("
     SELECT fh.batch_id, b.breed, fh.status_level, fh.mortality_count, fh.date_reported
     FROM flock_health fh
     JOIN batches b ON fh.batch_id = b.batch_id
-    WHERE b.status = 'Active'
-      AND fh.report_id = (
-          SELECT MAX(fh2.report_id) FROM flock_health fh2 WHERE fh2.batch_id = fh.batch_id
-      )
+    WHERE b.status='Active'
+      AND fh.report_id=(SELECT MAX(fh2.report_id) FROM flock_health fh2 WHERE fh2.batch_id=fh.batch_id)
     ORDER BY FIELD(fh.status_level,'Critical','Warning','Healthy')
     LIMIT 4
 ");
 
-// --- NEXT BATCH REPLACEMENT ---
-$next_batch = $conn->query("
-    SELECT batch_id, breed, expected_replacement
-    FROM batches
-    WHERE status='Active' AND expected_replacement IS NOT NULL
-    ORDER BY expected_replacement ASC
-    LIMIT 1
-");
-$nb = $next_batch ? $next_batch->fetch_assoc() : null;
-$days_left = $nb ? (int) ceil((strtotime($nb['expected_replacement']) - time()) / 86400) : null;
+// ── NEXT BATCH REPLACEMENT ────────────────────────────────────
+$next_batch = $conn->query("SELECT batch_id,breed,expected_replacement FROM batches WHERE status='Active' AND expected_replacement IS NOT NULL ORDER BY expected_replacement ASC LIMIT 1");
+$nb        = $next_batch ? $next_batch->fetch_assoc() : null;
+$days_left = $nb ? (int)ceil((strtotime($nb['expected_replacement']) - time()) / 86400) : null;
 
 $js_labels   = json_encode($chart_labels);
 $js_data     = json_encode($chart_data);
@@ -125,59 +105,19 @@ $js_rev_data = json_encode($rev_data);
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-<!-- ── PAGE HEADER ─────────────────────────────────────────── -->
+<!-- ── PAGE HEADER ────────────────────────────────────────── -->
 <div class="page-header">
     <div>
         <h2>📊 Management Dashboard</h2>
         <p>Welcome back, <strong style="color:var(--gold);"><?php echo htmlspecialchars($_SESSION['username']); ?></strong> — here's your farm today.</p>
     </div>
-    <span style="font-size:0.82rem; color:var(--text-muted); font-weight:600;">
-        <?php echo date('l, F j, Y'); ?>
-    </span>
-</div>
-
-<!-- ── PENDING ALERT ──────────────────────────────────────── -->
-<?php if ($pending_count > 0): ?>
-<div class="alert-action">
-    <div>
-        <h4><span class="red-dot"></span>Action Required: Staff Edit Requests</h4>
-        <p><strong><?php echo $pending_count; ?></strong> staff member<?php echo $pending_count > 1 ? 's are' : ' is'; ?> requesting to correct their log entries.</p>
-    </div>
-    <a href="review_requests.php" class="btn-farm btn-amber" style="white-space:nowrap;">Review Requests →</a>
-</div>
-<?php endif; ?>
-
-
-<!-- ── OLD STOCK COMPLETED ALERT ─────────────────────────── -->
-<?php if ($completed_notif): ?>
-<div class="alert success" style="margin-bottom:1.2rem;">
-    🎉 Old stock cleared! Batch #<?php echo $completed_notif['batch_id']; ?>
-    (<?php echo htmlspecialchars($completed_notif['breed']); ?>) has been fully sold.
-    Staff completed the target on <?php echo date('M d, g:i A', strtotime($completed_notif['completed_at'])); ?>.
-</div>
-<?php endif; ?>
-
-<!-- ── ACTIVE SELL-FIRST REMINDER ────────────────────────── -->
-<?php if ($sell_notif): ?>
-<div style="background:rgba(212,144,10,0.08); border:1px solid rgba(212,144,10,0.3);
-            border-left:4px solid var(--warning); border-radius:var(--radius);
-            padding:11px 16px; margin-bottom:1.2rem;
-            display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-    <div style="font-size:0.84rem; color:var(--text-secondary);">
-        ⏳ <strong style="color:var(--gold);">Sell-First Active:</strong>
-        Batch #<?php echo $sell_notif['batch_id']; ?>
-        (<?php echo htmlspecialchars($sell_notif['breed']); ?>) —
-        Target: <strong style="color:var(--gold);"><?php echo number_format($sell_notif['target_trays']); ?> trays</strong>
-        <span class="badge badge-<?php echo $sell_notif['status']==='unread' ? 'warning' : 'pending'; ?>"
-              style="margin-left:6px; font-size:0.6rem;">
-            <?php echo $sell_notif['status']==='unread' ? 'Not seen yet' : 'Seen by staff'; ?>
+    <div style="display:flex; align-items:center; gap:14px;">
+        <span style="font-size:0.82rem; color:var(--text-muted); font-weight:600;">
+            <?php echo date('l, F j, Y'); ?>
         </span>
+        <?php render_notification_bell($conn, 'Owner'); ?>
     </div>
-    <a href="manage_flock/inventory.php" class="btn-farm btn-amber btn-sm" style="white-space:nowrap;">
-        View Inventory →
-    </a>
 </div>
-<?php endif; ?>
 
 <!-- ── STAT CARDS ─────────────────────────────────────────── -->
 <div style="display:flex; gap:16px; margin-bottom:2rem; flex-wrap:wrap;">
@@ -201,12 +141,9 @@ $js_rev_data = json_encode($rev_data);
         <div class="stat-value" style="font-size:1.5rem;">₱<?php echo number_format($month_rev, 0); ?></div>
         <div class="stat-sub">
             <?php if ($rev_pct !== null): ?>
-                <?php if ($rev_pct >= 0): ?>
-                    <span style="color:var(--success);">▲ <?php echo $rev_pct; ?>%</span>
-                <?php else: ?>
-                    <span style="color:var(--danger);">▼ <?php echo abs($rev_pct); ?>%</span>
-                <?php endif; ?>
-                vs last month
+                <span style="color:<?php echo $rev_pct >= 0 ? 'var(--success)' : 'var(--danger)'; ?>;">
+                    <?php echo $rev_pct >= 0 ? '▲' : '▼'; ?> <?php echo abs($rev_pct); ?>%
+                </span> vs last month
             <?php else: ?>
                 <?php echo date('F Y'); ?>
             <?php endif; ?>
@@ -219,30 +156,35 @@ $js_rev_data = json_encode($rev_data);
         <div class="stat-sub">registered farm workers</div>
     </div>
 
-    <div class="stat-card" style="border-top:3px solid var(--warning);">
-        <div class="stat-label">Pending Requests</div>
-        <div class="stat-value"><?php echo $pending_count; ?></div>
-        <div class="stat-sub">awaiting your review</div>
-    </div>
+    <a href="my_notifications.php" style="text-decoration:none; flex:1; min-width:180px;">
+        <div class="stat-card" style="border-top:3px solid var(--warning); cursor:pointer; transition:border-color 0.2s;"
+             onmouseover="this.style.borderColor='var(--danger)'"
+             onmouseout="this.style.borderColor='var(--warning)'">
+            <div class="stat-label">Pending Requests</div>
+            <div class="stat-value" style="color:<?php echo $pending_count > 0 ? 'var(--danger)' : 'var(--text-primary)'; ?>;">
+                <?php echo $pending_count; ?>
+            </div>
+            <div class="stat-sub" style="color:<?php echo $pending_count > 0 ? 'var(--warning)' : 'var(--text-muted)'; ?>;">
+                <?php echo $pending_count > 0 ? 'tap to review ↗' : 'all caught up'; ?>
+            </div>
+        </div>
+    </a>
 
 </div>
 
-<!-- ── ROW 1: CHARTS ─────────────────────────────────────── -->
+<!-- ── CHARTS ROW ─────────────────────────────────────────── -->
 <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:20px;">
-
     <div class="card" style="padding:1.4rem 1.6rem;">
         <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">🥚 Harvest — Last 7 Days</h3>
         <canvas id="harvestChart" style="max-height:220px;"></canvas>
     </div>
-
     <div class="card" style="padding:1.4rem 1.6rem;">
         <h3 style="margin-bottom:1.2rem; font-size:0.92rem;">💰 Revenue — Last 6 Months</h3>
         <canvas id="revenueChart" style="max-height:220px;"></canvas>
     </div>
-
 </div>
 
-<!-- ── ROW 2: TOP CUSTOMERS + FLOCK HEALTH + ACTIONS ──────── -->
+<!-- ── ROW 2: CUSTOMERS + HEALTH + ACTIONS ────────────────── -->
 <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px; margin-bottom:20px;">
 
     <!-- Top Customers -->
@@ -251,7 +193,7 @@ $js_rev_data = json_encode($rev_data);
         <?php if ($top_cust && $top_cust->num_rows > 0):
             $rank = 1;
             while ($c = $top_cust->fetch_assoc()):
-                $medal = match($rank) { 1 => '🥇', 2 => '🥈', 3 => '🥉', default => "#{$rank}" };
+                $medal = match($rank) { 1=>'🥇', 2=>'🥈', 3=>'🥉', default=>"#{$rank}" };
         ?>
         <div style="display:flex; justify-content:space-between; align-items:center;
                     padding:9px 0; border-bottom:1px solid var(--border-subtle);">
@@ -273,23 +215,17 @@ $js_rev_data = json_encode($rev_data);
         <?php $rank++; endwhile;
         else: ?>
         <div class="empty-state" style="padding:1.5rem 0;">
-            <span class="empty-icon">💰</span>
-            <p>No sales this month yet.</p>
+            <span class="empty-icon">💰</span><p>No sales this month yet.</p>
         </div>
         <?php endif; ?>
     </div>
 
-    <!-- Flock Health Summary -->
+    <!-- Flock Health -->
     <div class="card" style="padding:1.4rem 1.6rem;">
         <h3 style="font-size:0.92rem; margin-bottom:1.2rem;">🐔 Active Flock Health</h3>
         <?php if ($health_q && $health_q->num_rows > 0):
             while ($row = $health_q->fetch_assoc()):
-                $badge_class = match($row['status_level']) {
-                    'Healthy'  => 'badge-healthy',
-                    'Warning'  => 'badge-warning',
-                    'Critical' => 'badge-critical',
-                    default    => 'badge-pending',
-                };
+                $bc = match($row['status_level']) { 'Healthy'=>'badge-healthy','Warning'=>'badge-warning','Critical'=>'badge-critical', default=>'badge-pending' };
         ?>
         <div style="display:flex; justify-content:space-between; align-items:center;
                     padding:9px 0; border-bottom:1px solid var(--border-subtle);">
@@ -298,23 +234,21 @@ $js_rev_data = json_encode($rev_data);
                     Batch #<?php echo $row['batch_id']; ?> — <?php echo htmlspecialchars($row['breed']); ?>
                 </div>
                 <div style="font-size:0.72rem; color:var(--text-muted);">
-                    Mortality: <?php echo $row['mortality_count']; ?> ·
-                    <?php echo date('M d', strtotime($row['date_reported'])); ?>
+                    Mortality: <?php echo $row['mortality_count']; ?> · <?php echo date('M d', strtotime($row['date_reported'])); ?>
                 </div>
             </div>
-            <span class="badge <?php echo $badge_class; ?>"><?php echo $row['status_level']; ?></span>
+            <span class="badge <?php echo $bc; ?>"><?php echo $row['status_level']; ?></span>
         </div>
         <?php endwhile;
         else: ?>
         <div class="empty-state" style="padding:1.5rem 0;">
-            <span class="empty-icon">🐔</span>
-            <p>No health reports yet.</p>
+            <span class="empty-icon">🐔</span><p>No health reports yet.</p>
         </div>
         <?php endif; ?>
 
         <?php if ($nb && $days_left !== null): ?>
-        <div style="margin-top:14px; background:var(--bg-wood); border-left:3px solid
-                    <?php echo $days_left <= 30 ? 'var(--danger)' : 'var(--terra-lt)'; ?>;
+        <div style="margin-top:14px; background:var(--bg-wood);
+                    border-left:3px solid <?php echo $days_left <= 30 ? 'var(--danger)' : 'var(--terra-lt)'; ?>;
                     padding:10px 12px; border-radius:0 6px 6px 0;">
             <div style="font-size:0.72rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:4px;">
                 Next Replacement
@@ -330,111 +264,116 @@ $js_rev_data = json_encode($rev_data);
         <?php endif; ?>
     </div>
 
-    <!-- Admin Quick Actions -->
+    <!-- ── QUICK ACTIONS — grouped by subfolder ────────────── -->
     <div>
-        <div style="font-size:0.7rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">
-            Quick Actions
+
+        <!-- 📦 INVENTORY -->
+        <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted);
+                    text-transform:uppercase; letter-spacing:1px; margin-bottom:7px;">
+            📦 Inventory
         </div>
-        <div style="display:flex; flex-direction:column; gap:7px;">
-            <a href="manage_flock/batches.php"  class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px;">📦 Flock Batches</a>
-            <a href="manage_flock/prices.php"   class="btn-farm btn-orange" style="text-align:center; font-size:0.85rem; padding:10px;">🏷️ Unit Pricing</a>
-            <a href="manage_flock/inventory.php"  class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px;">🥚 Inventory</a>
-
-            <div style="border-top:1px solid var(--border-subtle); margin:3px 0;"></div>
-            <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px;">Sales</div>
-
-            <a href="manage_sales/view_sales.php"   class="btn-farm btn-green" style="text-align:center; font-size:0.85rem; padding:10px;">💰 Sales History</a>
-            <a href="manage_sales/sales_report.php" class="btn-farm btn-green" style="text-align:center; font-size:0.85rem; padding:10px; background:#2d6b40;">📊 Sales Report</a>
-
-            <div style="border-top:1px solid var(--border-subtle); margin:3px 0;"></div>
-
-            <a href="logs/view_history.php"    class="btn-farm btn-gray"   style="text-align:center; font-size:0.85rem; padding:10px;">📜 Activity Log</a>
-            <a href="reports/review_requests.php" class="btn-farm btn-outline"
-               style="text-align:center; font-size:0.85rem; padding:10px; display:flex; align-items:center; justify-content:center; gap:6px;">
-                <?php if ($pending_count > 0): ?><span class="sidebar-dot"></span><?php endif; ?>
-                Manage Requests (<?php echo $pending_count; ?>)
+        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px;">
+            <a href="manage_inventory/inventory.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px;">
+               🥚 Active Stock
             </a>
-            <a href="manage_users/users.php"    class="btn-farm btn-dark"   style="text-align:center; font-size:0.85rem; padding:10px; background:var(--bg-plank);">👥 Farm Staff</a>
+            <a href="manage_inventory/inventory_history.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px; opacity:0.8;">
+               🗃️ Inventory History
+            </a>
         </div>
-    </div>
+
+        <!-- 🐔 FLOCKS -->
+        <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted);
+                    text-transform:uppercase; letter-spacing:1px; margin-bottom:7px;">
+            🐔 Flocks
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px;">
+            <a href="manage_flocks/batches.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px;">
+               📦 Active Batches
+            </a>
+            <a href="manage_flocks/flock_history.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px; opacity:0.8;">
+               🗃️ Flock History
+            </a>
+        </div>
+
+        <!-- 💰 SALES -->
+        <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted);
+                    text-transform:uppercase; letter-spacing:1px; margin-bottom:7px;">
+            💰 Sales
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px;">
+            <a href="manage_sales/view_sales.php"
+               class="btn-farm btn-orange" style="text-align:center; font-size:0.85rem; padding:9px;">
+               💰 Today's Sales
+            </a>
+             <a href="manage_sales/prices.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px;">
+               🏷️ Egg Pricing
+            </a>
+            <a href="manage_sales/sales_history.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px; opacity:0.8;">
+               🗃️ Sales History
+            </a>
+        </div>
+
+        <!-- 👥 USERS -->
+        <div style="font-size:0.68rem; font-weight:700; color:var(--text-muted);
+                    text-transform:uppercase; letter-spacing:1px; margin-bottom:7px;">
+            👥 Users
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+            <a href="manage_users/users.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px;">
+               👥 Farm Staff
+            </a>
+            <a href="manage_users/user_activity_log.php"
+               class="btn-farm btn-dark" style="text-align:center; font-size:0.85rem; padding:9px; opacity:0.8;">
+               📜 Activity Log
+            </a>
+        </div>
+
+    </div><!-- end quick actions -->
 
 </div>
 
 <!-- ── CHART SCRIPTS ─────────────────────────────────────── -->
 <script>
-const chartDefaults = {
-    gridColor: 'rgba(232,168,56,0.06)',
-    tickColor: '#7A6E5E',
-    tooltipBg: '#2E2720',
-    tooltipText: '#F2EAD8',
-};
+const cd = { gc:'rgba(232,168,56,0.06)', tc:'#7A6E5E', bg:'#2E2720', tx:'#F2EAD8' };
 
-// Chart 1 — Harvest (bar)
 new Chart(document.getElementById('harvestChart').getContext('2d'), {
     type: 'bar',
     data: {
         labels: <?php echo $js_labels; ?>,
-        datasets: [{
-            label: 'Eggs',
-            data: <?php echo $js_data; ?>,
-            backgroundColor: 'rgba(232,168,56,0.18)',
-            borderColor: '#E8A838',
-            borderWidth: 2,
-            borderRadius: 5,
-            hoverBackgroundColor: 'rgba(232,168,56,0.35)',
-        }]
+        datasets: [{ label:'Eggs', data:<?php echo $js_data; ?>,
+            backgroundColor:'rgba(232,168,56,0.18)', borderColor:'#E8A838',
+            borderWidth:2, borderRadius:5, hoverBackgroundColor:'rgba(232,168,56,0.35)' }]
     },
-    options: {
-        responsive: true,
-        plugins: {
-            legend: { display: false },
-            tooltip: {
-                backgroundColor: chartDefaults.tooltipBg,
-                titleColor: chartDefaults.tooltipText,
-                bodyColor: '#B8A88A',
-                callbacks: { label: c => ` ${c.parsed.y.toLocaleString()} eggs` }
-            }
-        },
-        scales: {
-            y: { beginAtZero:true, grid:{color:chartDefaults.gridColor}, ticks:{color:chartDefaults.tickColor, precision:0} },
-            x: { grid:{display:false}, ticks:{color:chartDefaults.tickColor} }
-        }
-    }
+    options: { responsive:true,
+        plugins:{ legend:{display:false},
+            tooltip:{ backgroundColor:cd.bg,titleColor:cd.tx,bodyColor:'#B8A88A',
+                callbacks:{label:c=>` ${c.parsed.y.toLocaleString()} eggs`} } },
+        scales:{ y:{beginAtZero:true,grid:{color:cd.gc},ticks:{color:cd.tc,precision:0}},
+                 x:{grid:{display:false},ticks:{color:cd.tc}} } }
 });
 
-// Chart 2 — Revenue (line)
 new Chart(document.getElementById('revenueChart').getContext('2d'), {
     type: 'line',
     data: {
         labels: <?php echo $js_rev_lbl; ?>,
-        datasets: [{
-            label: 'Revenue',
-            data: <?php echo $js_rev_data; ?>,
-            borderColor: '#4E9B5B',
-            backgroundColor: 'rgba(78,155,91,0.08)',
-            fill: true,
-            tension: 0.4,
-            pointBackgroundColor: '#4E9B5B',
-            pointRadius: 5,
-            pointHoverRadius: 7,
-        }]
+        datasets: [{ label:'Revenue', data:<?php echo $js_rev_data; ?>,
+            borderColor:'#4E9B5B', backgroundColor:'rgba(78,155,91,0.08)',
+            fill:true, tension:0.4, pointBackgroundColor:'#4E9B5B',
+            pointRadius:5, pointHoverRadius:7 }]
     },
-    options: {
-        responsive: true,
-        plugins: {
-            legend: { display: false },
-            tooltip: {
-                backgroundColor: chartDefaults.tooltipBg,
-                titleColor: chartDefaults.tooltipText,
-                bodyColor: '#B8A88A',
-                callbacks: { label: c => ` ₱${c.parsed.y.toLocaleString()}` }
-            }
-        },
-        scales: {
-            y: { beginAtZero:true, grid:{color:chartDefaults.gridColor}, ticks:{color:chartDefaults.tickColor, callback: v => '₱'+v.toLocaleString()} },
-            x: { grid:{display:false}, ticks:{color:chartDefaults.tickColor} }
-        }
-    }
+    options: { responsive:true,
+        plugins:{ legend:{display:false},
+            tooltip:{ backgroundColor:cd.bg,titleColor:cd.tx,bodyColor:'#B8A88A',
+                callbacks:{label:c=>` ₱${c.parsed.y.toLocaleString()}`} } },
+        scales:{ y:{beginAtZero:true,grid:{color:cd.gc},ticks:{color:cd.tc,callback:v=>'₱'+v.toLocaleString()}},
+                 x:{grid:{display:false},ticks:{color:cd.tc}} } }
 });
 </script>
 

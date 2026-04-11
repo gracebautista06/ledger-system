@@ -118,7 +118,7 @@ function page_url($p, $from, $to, $method) {
             </div>
             <div style="padding-bottom:1px;">
                 <button type="submit" class="btn-farm btn-sm">🔍 Filter</button>
-                <a href="view_sales.php" class="btn-farm btn-dark btn-sm" style="margin-left:6px;">✕ Reset</a>
+                <a href="sales_history.php" class="btn-farm btn-dark btn-sm" style="margin-left:6px;">✕ Reset</a>
             </div>
         </form>
     </div>

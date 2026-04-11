@@ -168,7 +168,7 @@ if ($format === 'excel') {
 <!-- Print Controls (hidden on print) -->
 <div class="no-print">
     <button onclick="window.print()">🖨️ Print / Save PDF</button>
-    <button class="close-btn" onclick="window.close()">✕ Close</button>
+    <button class="close-btn" onclick="window.location.href='sales_history.php'">✕ Close</button>
 </div>
 
 <!-- Header -->
